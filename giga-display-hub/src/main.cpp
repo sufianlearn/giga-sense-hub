@@ -1,13 +1,12 @@
-// GigaSenseHub — Home Security Dashboard
+// GigaSenseHub — Multi-Page Home Security App
 // LVGL 9 on Arduino GIGA R1 + Display Shield (800x480)
-// Live ESP32-S3 camera feed + GIGA BMI270 IMU sensor data
+// Pages: Login (PIN) → Dashboard (cameras/locks/sensors) → Settings
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <Arduino_H7_Video.h>
 #include <Arduino_GigaDisplayTouch.h>
 #include <Arduino_BMI270_BMM150.h>
-BoschSensorClass myIMU(Wire1);
 #include <lvgl.h>
 #include "SDRAM.h"
 #include "protocol.h"
@@ -15,10 +14,14 @@ BoschSensorClass myIMU(Wire1);
 
 Arduino_H7_Video display(800, 480, GigaDisplayShield);
 Arduino_GigaDisplayTouch touchCtrl;
+BoschSensorClass myIMU(Wire1);
 
-// --- Colors ---
+// ============================================================
+// Theme Colors
+// ============================================================
 #define C_BG          lv_color_hex(0x0D1117)
 #define C_CARD        lv_color_hex(0x161B22)
+#define C_CARD_HOVER  lv_color_hex(0x1C2129)
 #define C_ACCENT      lv_color_hex(0x58A6FF)
 #define C_GREEN       lv_color_hex(0x3FB950)
 #define C_RED         lv_color_hex(0xF85149)
@@ -26,8 +29,25 @@ Arduino_GigaDisplayTouch touchCtrl;
 #define C_TEXT        lv_color_hex(0xE6EDF3)
 #define C_TEXT_DIM    lv_color_hex(0x8B949E)
 #define C_BORDER      lv_color_hex(0x30363D)
+#define C_PIN_BTN     lv_color_hex(0x21262D)
+#define C_PIN_BTN_PR  lv_color_hex(0x30363D)
 
-// --- State ---
+// ============================================================
+// App State
+// ============================================================
+enum AppPage { PAGE_LOGIN, PAGE_DASHBOARD, PAGE_SETTINGS };
+AppPage currentPage = PAGE_LOGIN;
+
+struct AppSettings {
+  char pin[5] = "1234";
+  int autoLockSecs = 120;
+  int motionThreshold = 50;   // percentage 0-100
+  int targetFps = 15;
+  int jpegQuality = 12;
+};
+AppSettings settings;
+
+// WiFi / Stream
 WiFiClient streamClient;
 bool streamConnected = false;
 bool wifiConnected = false;
@@ -35,41 +55,70 @@ unsigned long lastFpsCalc = 0;
 unsigned int frameCount = 0;
 float currentFps = 0;
 
+// IMU
 float accelX = 0, accelY = 0, accelZ = 0;
 float gyroX = 0, gyroY = 0, gyroZ = 0;
 bool imuReady = false;
 bool imuOnWire1 = false;
 
-bool frontDoorLocked = true;
-bool backDoorLocked = true;
-bool garageLocked = true;
-bool windowLiving = false;
-bool windowBedroom = false;
-bool windowKitchen = false;
+// Door / Window state
+bool doorLocked[3] = {true, true, true};
+const char *doorNames[3] = {"Front Door", "Back Door", "Garage"};
+bool windowOpen[3] = {false, false, false};
+const char *windowNames[3] = {"Living Room", "Bedroom", "Kitchen"};
 
+// Auto-lock
+unsigned long lastActivity = 0;
+
+// JPEG
 #define JPEG_BUF_SIZE (32 * 1024)
 static uint8_t jpegBuf[JPEG_BUF_SIZE];
 static int jpegLen = 0;
 
-// --- Video frame buffer in SDRAM ---
+// Video buffer
 #define CAM_W FRAME_WIDTH
 #define CAM_H FRAME_HEIGHT
 static uint16_t *camFrameBuf = nullptr;
 static lv_image_dsc_t camImgDsc;
+
+// ============================================================
+// LVGL Screen Objects
+// ============================================================
+static lv_obj_t *scrLogin = nullptr;
+static lv_obj_t *scrDashboard = nullptr;
+static lv_obj_t *scrSettings = nullptr;
+
+// Login page
+static lv_obj_t *pinDots[4];
+static lv_obj_t *lblLoginError;
+static char pinEntry[5] = "";
+static int pinPos = 0;
+
+// Dashboard page
 static lv_obj_t *camImg = nullptr;
+static lv_obj_t *lblFps;
+static lv_obj_t *lblStreamStatus;
+static lv_obj_t *swDoor[3];
+static lv_obj_t *ledDoor[3];
+static lv_obj_t *ledWin[3];
+static lv_obj_t *lblWin[3];
+static lv_obj_t *lblAccel, *lblGyro, *lblMotion, *lblUptime;
+static lv_obj_t *lblStatusBar;
 
-// --- LVGL UI elements ---
-static lv_obj_t *lbl_fps;
-static lv_obj_t *lbl_stream_status;
-static lv_obj_t *sw_front_door, *sw_back_door, *sw_garage;
-static lv_obj_t *led_front, *led_back, *led_garage;
-static lv_obj_t *led_win_living, *led_win_bedroom, *led_win_kitchen;
-static lv_obj_t *lbl_win_living, *lbl_win_bedroom, *lbl_win_kitchen;
-static lv_obj_t *lbl_accel, *lbl_gyro, *lbl_motion, *lbl_uptime;
-static lv_obj_t *lbl_status_bar;
+// Settings page
+static lv_obj_t *lblSettingsWifi;
+static lv_obj_t *sliderMotion, *lblMotionVal;
+static lv_obj_t *sliderAutoLock, *lblAutoLockVal;
+static lv_obj_t *sliderFps, *lblFpsVal;
+static lv_obj_t *sliderQuality, *lblQualityVal;
+static lv_obj_t *lblSysUptime, *lblSysMem, *lblSysFw;
 
-// --- JPEG decode into SDRAM framebuffer ---
+// PIN change in settings
+static lv_obj_t *taNewPin;
 
+// ============================================================
+// JPEG Decoder
+// ============================================================
 struct JpegSession { const uint8_t *data; int len; int pos; };
 
 static unsigned int tjpg_input(JDEC *jd, uint8_t *buf, unsigned int n) {
@@ -84,14 +133,12 @@ static unsigned int tjpg_input(JDEC *jd, uint8_t *buf, unsigned int n) {
 static int tjpg_output(JDEC *jd, void *bmp, JRECT *r) {
   uint16_t *px = (uint16_t *)bmp;
   if (!camFrameBuf) return 0;
-  for (int y = r->top; y <= r->bottom; y++) {
+  for (int y = r->top; y <= r->bottom; y++)
     for (int x = r->left; x <= r->right; x++) {
-      if ((unsigned)x < CAM_W && (unsigned)y < CAM_H) {
+      if ((unsigned)x < CAM_W && (unsigned)y < CAM_H)
         camFrameBuf[y * CAM_W + x] = *px;
-      }
       px++;
     }
-  }
   return 1;
 }
 
@@ -101,7 +148,7 @@ static int tjpg_output(JDEC *jd, void *bmp, JRECT *r) {
 static uint8_t tjWork[TJPGD_WORKSPACE_SIZE];
 
 void decodeFrame() {
-  JpegSession sess = { jpegBuf, jpegLen, 0 };
+  JpegSession sess = {jpegBuf, jpegLen, 0};
   JDEC jd;
   if (jd_prepare(&jd, tjpg_input, tjWork, TJPGD_WORKSPACE_SIZE, &sess) == JDR_OK) {
     jd_decomp(&jd, tjpg_output, 0);
@@ -112,23 +159,10 @@ void decodeFrame() {
   }
 }
 
-// --- Lock callback ---
-static void lock_cb(lv_event_t *e) {
-  lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
-  bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
-  lv_obj_t *led = nullptr;
-  if (sw == sw_front_door) { frontDoorLocked = on; led = led_front; }
-  else if (sw == sw_back_door) { backDoorLocked = on; led = led_back; }
-  else if (sw == sw_garage) { garageLocked = on; led = led_garage; }
-  if (led) {
-    lv_led_set_color(led, on ? C_GREEN : C_RED);
-    lv_led_set_brightness(led, on ? 200 : 255);
-  }
-}
-
-// --- UI Helpers ---
-
-static lv_obj_t* mkCard(lv_obj_t *p, int w, int h) {
+// ============================================================
+// UI Helpers
+// ============================================================
+static lv_obj_t *mkCard(lv_obj_t *p, int w, int h) {
   lv_obj_t *c = lv_obj_create(p);
   lv_obj_set_size(c, w, h);
   lv_obj_set_style_bg_color(c, C_CARD, 0);
@@ -141,21 +175,14 @@ static lv_obj_t* mkCard(lv_obj_t *p, int w, int h) {
   return c;
 }
 
-static lv_obj_t* mkTitle(lv_obj_t *p, const char *t) {
+static lv_obj_t *mkTitle(lv_obj_t *p, const char *t) {
   lv_obj_t *l = lv_label_create(p);
   lv_label_set_text(l, t);
   lv_obj_set_style_text_color(l, C_ACCENT, 0);
   return l;
 }
 
-static lv_obj_t* mkDim(lv_obj_t *p, const char *t) {
-  lv_obj_t *l = lv_label_create(p);
-  lv_label_set_text(l, t);
-  lv_obj_set_style_text_color(l, C_TEXT_DIM, 0);
-  return l;
-}
-
-static lv_obj_t* mkRow(lv_obj_t *p, int h) {
+static lv_obj_t *mkRow(lv_obj_t *p, int h) {
   lv_obj_t *r = lv_obj_create(p);
   lv_obj_set_size(r, lv_pct(100), h);
   lv_obj_set_style_bg_opa(r, LV_OPA_TRANSP, 0);
@@ -167,47 +194,236 @@ static lv_obj_t* mkRow(lv_obj_t *p, int h) {
   return r;
 }
 
-static void mkDoorRow(lv_obj_t *p, const char *name, lv_obj_t **sw_out, lv_obj_t **led_out, bool locked) {
-  lv_obj_t *row = mkRow(p, 34);
-  *led_out = lv_led_create(row);
-  lv_led_set_color(*led_out, locked ? C_GREEN : C_RED);
-  lv_led_set_brightness(*led_out, locked ? 200 : 255);
-  lv_obj_set_size(*led_out, 12, 12);
-  lv_obj_t *lbl = lv_label_create(row);
-  lv_label_set_text(lbl, name);
-  lv_obj_set_style_text_color(lbl, C_TEXT, 0);
-  lv_obj_set_flex_grow(lbl, 1);
-  *sw_out = lv_switch_create(row);
-  if (locked) lv_obj_add_state(*sw_out, LV_STATE_CHECKED);
-  lv_obj_set_style_bg_color(*sw_out, C_RED, 0);
-  lv_obj_set_style_bg_color(*sw_out, C_GREEN, LV_PART_INDICATOR | LV_STATE_CHECKED);
-  lv_obj_add_event_cb(*sw_out, lock_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+static void touchActivity() { lastActivity = millis(); }
+
+// ============================================================
+// PAGE 1: LOGIN
+// ============================================================
+
+static void pinAppend(char c) {
+  if (pinPos >= 4) return;
+  pinEntry[pinPos++] = c;
+  pinEntry[pinPos] = '\0';
+
+  for (int i = 0; i < 4; i++) {
+    lv_obj_set_style_bg_color(pinDots[i], i < pinPos ? C_ACCENT : C_BORDER, 0);
+    lv_obj_set_style_bg_opa(pinDots[i], LV_OPA_COVER, 0);
+  }
+
+  if (pinPos == 4) {
+    if (strcmp(pinEntry, settings.pin) == 0) {
+      lv_label_set_text(lblLoginError, "");
+      pinPos = 0;
+      pinEntry[0] = '\0';
+      for (int i = 0; i < 4; i++)
+        lv_obj_set_style_bg_color(pinDots[i], C_BORDER, 0);
+
+      lastActivity = millis();
+      currentPage = PAGE_DASHBOARD;
+      lv_screen_load_anim(scrDashboard, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+      Serial.println("Login OK -> Dashboard");
+    } else {
+      lv_label_set_text(lblLoginError, "Wrong PIN");
+      lv_obj_set_style_text_color(lblLoginError, C_RED, 0);
+      for (int i = 0; i < 4; i++)
+        lv_obj_set_style_bg_color(pinDots[i], C_RED, 0);
+
+      pinPos = 0;
+      pinEntry[0] = '\0';
+      lv_timer_t *t = lv_timer_create([](lv_timer_t *timer) {
+        for (int i = 0; i < 4; i++)
+          lv_obj_set_style_bg_color(pinDots[i], C_BORDER, 0);
+        lv_label_set_text(lblLoginError, "");
+        lv_timer_delete(timer);
+      }, 800, nullptr);
+      (void)t;
+    }
+  }
 }
 
-static void mkWinRow(lv_obj_t *p, const char *name, lv_obj_t **led_out, lv_obj_t **lbl_out, bool open) {
+static void pinClear() {
+  pinPos = 0;
+  pinEntry[0] = '\0';
+  for (int i = 0; i < 4; i++)
+    lv_obj_set_style_bg_color(pinDots[i], C_BORDER, 0);
+  lv_label_set_text(lblLoginError, "");
+}
+
+static void pinBtnCb(lv_event_t *e) {
+  touchActivity();
+  const char *txt = lv_label_get_text(lv_obj_get_child((lv_obj_t *)lv_event_get_target(e), 0));
+  if (strcmp(txt, LV_SYMBOL_BACKSPACE) == 0) {
+    if (pinPos > 0) {
+      pinPos--;
+      pinEntry[pinPos] = '\0';
+      lv_obj_set_style_bg_color(pinDots[pinPos], C_BORDER, 0);
+    }
+  } else if (strcmp(txt, "C") == 0) {
+    pinClear();
+  } else {
+    pinAppend(txt[0]);
+  }
+}
+
+static lv_obj_t *mkPinBtn(lv_obj_t *parent, const char *txt, int w, int h) {
+  lv_obj_t *btn = lv_obj_create(parent);
+  lv_obj_set_size(btn, w, h);
+  lv_obj_set_style_bg_color(btn, C_PIN_BTN, 0);
+  lv_obj_set_style_bg_color(btn, C_PIN_BTN_PR, LV_STATE_PRESSED);
+  lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(btn, 12, 0);
+  lv_obj_set_style_border_width(btn, 0, 0);
+  lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+
+  lv_obj_t *lbl = lv_label_create(btn);
+  lv_label_set_text(lbl, txt);
+  lv_obj_set_style_text_color(lbl, C_TEXT, 0);
+  lv_obj_center(lbl);
+
+  lv_obj_add_event_cb(btn, pinBtnCb, LV_EVENT_CLICKED, nullptr);
+  return btn;
+}
+
+void buildLoginPage() {
+  scrLogin = lv_obj_create(nullptr);
+  lv_obj_set_style_bg_color(scrLogin, C_BG, 0);
+
+  // Title
+  lv_obj_t *title = lv_label_create(scrLogin);
+  lv_label_set_text(title, LV_SYMBOL_HOME "  GigaSenseHub");
+  lv_obj_set_style_text_color(title, C_TEXT, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 40);
+
+  lv_obj_t *subtitle = lv_label_create(scrLogin);
+  lv_label_set_text(subtitle, "Enter PIN to unlock");
+  lv_obj_set_style_text_color(subtitle, C_TEXT_DIM, 0);
+  lv_obj_align(subtitle, LV_ALIGN_TOP_MID, 0, 70);
+
+  // PIN dots
+  lv_obj_t *dotRow = lv_obj_create(scrLogin);
+  lv_obj_set_size(dotRow, 160, 30);
+  lv_obj_set_style_bg_opa(dotRow, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(dotRow, 0, 0);
+  lv_obj_set_style_pad_all(dotRow, 0, 0);
+  lv_obj_set_flex_flow(dotRow, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(dotRow, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(dotRow, 16, 0);
+  lv_obj_align(dotRow, LV_ALIGN_TOP_MID, 0, 105);
+  lv_obj_clear_flag(dotRow, LV_OBJ_FLAG_SCROLLABLE);
+
+  for (int i = 0; i < 4; i++) {
+    pinDots[i] = lv_obj_create(dotRow);
+    lv_obj_set_size(pinDots[i], 20, 20);
+    lv_obj_set_style_radius(pinDots[i], LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(pinDots[i], C_BORDER, 0);
+    lv_obj_set_style_bg_opa(pinDots[i], LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(pinDots[i], C_ACCENT, 0);
+    lv_obj_set_style_border_width(pinDots[i], 2, 0);
+    lv_obj_clear_flag(pinDots[i], LV_OBJ_FLAG_SCROLLABLE);
+  }
+
+  // Error label
+  lblLoginError = lv_label_create(scrLogin);
+  lv_label_set_text(lblLoginError, "");
+  lv_obj_set_style_text_color(lblLoginError, C_RED, 0);
+  lv_obj_align(lblLoginError, LV_ALIGN_TOP_MID, 0, 140);
+
+  // Numpad
+  lv_obj_t *pad = lv_obj_create(scrLogin);
+  lv_obj_set_size(pad, 240, 310);
+  lv_obj_set_style_bg_opa(pad, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(pad, 0, 0);
+  lv_obj_set_style_pad_all(pad, 0, 0);
+  lv_obj_set_style_pad_row(pad, 8, 0);
+  lv_obj_set_style_pad_column(pad, 8, 0);
+  lv_obj_set_flex_flow(pad, LV_FLEX_FLOW_ROW_WRAP);
+  lv_obj_set_flex_align(pad, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_align(pad, LV_ALIGN_TOP_MID, 0, 165);
+  lv_obj_clear_flag(pad, LV_OBJ_FLAG_SCROLLABLE);
+
+  const char *keys[] = {"1","2","3","4","5","6","7","8","9","C","0",LV_SYMBOL_BACKSPACE};
+  for (int i = 0; i < 12; i++) {
+    mkPinBtn(pad, keys[i], 68, 62);
+  }
+}
+
+// ============================================================
+// PAGE 2: DASHBOARD
+// ============================================================
+
+static void lockCb(lv_event_t *e) {
+  touchActivity();
+  lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
+  bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+  for (int i = 0; i < 3; i++) {
+    if (sw == swDoor[i]) {
+      doorLocked[i] = on;
+      lv_led_set_color(ledDoor[i], on ? C_GREEN : C_RED);
+      lv_led_set_brightness(ledDoor[i], on ? 200 : 255);
+    }
+  }
+}
+
+static void gotoSettingsCb(lv_event_t *e) {
+  touchActivity();
+  currentPage = PAGE_SETTINGS;
+  lv_screen_load_anim(scrSettings, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+  Serial.println("Dashboard -> Settings");
+}
+
+static void logoutCb(lv_event_t *e) {
+  touchActivity();
+  currentPage = PAGE_LOGIN;
+  pinClear();
+  lv_screen_load_anim(scrLogin, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
+  Serial.println("Dashboard -> Login (logout)");
+}
+
+static void mkDoorRow(lv_obj_t *p, int idx) {
+  lv_obj_t *row = mkRow(p, 34);
+  ledDoor[idx] = lv_led_create(row);
+  lv_led_set_color(ledDoor[idx], doorLocked[idx] ? C_GREEN : C_RED);
+  lv_led_set_brightness(ledDoor[idx], doorLocked[idx] ? 200 : 255);
+  lv_obj_set_size(ledDoor[idx], 12, 12);
+
+  lv_obj_t *lbl = lv_label_create(row);
+  lv_label_set_text(lbl, doorNames[idx]);
+  lv_obj_set_style_text_color(lbl, C_TEXT, 0);
+  lv_obj_set_flex_grow(lbl, 1);
+
+  swDoor[idx] = lv_switch_create(row);
+  if (doorLocked[idx]) lv_obj_add_state(swDoor[idx], LV_STATE_CHECKED);
+  lv_obj_set_style_bg_color(swDoor[idx], C_RED, 0);
+  lv_obj_set_style_bg_color(swDoor[idx], C_GREEN, LV_PART_INDICATOR | LV_STATE_CHECKED);
+  lv_obj_add_event_cb(swDoor[idx], lockCb, LV_EVENT_VALUE_CHANGED, nullptr);
+}
+
+static void mkWinRow(lv_obj_t *p, int idx) {
   lv_obj_t *row = mkRow(p, 26);
   lv_obj_set_style_pad_column(row, 8, 0);
   lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  *led_out = lv_led_create(row);
-  lv_led_set_color(*led_out, open ? C_ORANGE : C_GREEN);
-  lv_led_set_brightness(*led_out, 200);
-  lv_obj_set_size(*led_out, 10, 10);
+
+  ledWin[idx] = lv_led_create(row);
+  lv_led_set_color(ledWin[idx], C_GREEN);
+  lv_led_set_brightness(ledWin[idx], 200);
+  lv_obj_set_size(ledWin[idx], 10, 10);
+
   lv_obj_t *n = lv_label_create(row);
-  lv_label_set_text(n, name);
+  lv_label_set_text(n, windowNames[idx]);
   lv_obj_set_style_text_color(n, C_TEXT, 0);
-  *lbl_out = lv_label_create(row);
-  lv_label_set_text(*lbl_out, open ? "OPEN" : "CLOSED");
-  lv_obj_set_style_text_color(*lbl_out, open ? C_ORANGE : C_GREEN, 0);
+
+  lblWin[idx] = lv_label_create(row);
+  lv_label_set_text(lblWin[idx], "CLOSED");
+  lv_obj_set_style_text_color(lblWin[idx], C_GREEN, 0);
 }
 
-// --- Build UI ---
+void buildDashboardPage() {
+  scrDashboard = lv_obj_create(nullptr);
+  lv_obj_set_style_bg_color(scrDashboard, C_BG, 0);
 
-void buildUI() {
-  lv_obj_t *scr = lv_scr_act();
-  lv_obj_set_style_bg_color(scr, C_BG, 0);
-
-  // Top bar
-  lv_obj_t *top = lv_obj_create(scr);
+  // --- Top bar ---
+  lv_obj_t *top = lv_obj_create(scrDashboard);
   lv_obj_set_size(top, 800, 34);
   lv_obj_set_pos(top, 0, 0);
   lv_obj_set_style_bg_color(top, C_CARD, 0);
@@ -219,29 +435,69 @@ void buildUI() {
   lv_obj_set_flex_flow(top, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(top, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-  lv_obj_t *title = lv_label_create(top);
-  lv_label_set_text(title, LV_SYMBOL_HOME "  GigaSenseHub Security");
-  lv_obj_set_style_text_color(title, C_TEXT, 0);
+  lv_obj_t *titleLbl = lv_label_create(top);
+  lv_label_set_text(titleLbl, LV_SYMBOL_HOME "  GigaSenseHub");
+  lv_obj_set_style_text_color(titleLbl, C_TEXT, 0);
 
-  lbl_status_bar = lv_label_create(top);
-  lv_label_set_text(lbl_status_bar, LV_SYMBOL_WIFI " Connecting...");
-  lv_obj_set_style_text_color(lbl_status_bar, C_ORANGE, 0);
+  lblStatusBar = lv_label_create(top);
+  lv_label_set_text(lblStatusBar, LV_SYMBOL_WIFI " Connecting...");
+  lv_obj_set_style_text_color(lblStatusBar, C_ORANGE, 0);
+
+  // Nav buttons container
+  lv_obj_t *navRow = lv_obj_create(top);
+  lv_obj_set_size(navRow, LV_SIZE_CONTENT, 30);
+  lv_obj_set_style_bg_opa(navRow, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(navRow, 0, 0);
+  lv_obj_set_style_pad_all(navRow, 0, 0);
+  lv_obj_set_style_pad_column(navRow, 6, 0);
+  lv_obj_set_flex_flow(navRow, LV_FLEX_FLOW_ROW);
+  lv_obj_clear_flag(navRow, LV_OBJ_FLAG_SCROLLABLE);
+
+  // Settings button
+  lv_obj_t *btnSettings = lv_obj_create(navRow);
+  lv_obj_set_size(btnSettings, 30, 26);
+  lv_obj_set_style_bg_color(btnSettings, C_PIN_BTN, 0);
+  lv_obj_set_style_bg_opa(btnSettings, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(btnSettings, 4, 0);
+  lv_obj_set_style_border_width(btnSettings, 0, 0);
+  lv_obj_clear_flag(btnSettings, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(btnSettings, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_t *sIcon = lv_label_create(btnSettings);
+  lv_label_set_text(sIcon, LV_SYMBOL_SETTINGS);
+  lv_obj_set_style_text_color(sIcon, C_TEXT_DIM, 0);
+  lv_obj_center(sIcon);
+  lv_obj_add_event_cb(btnSettings, gotoSettingsCb, LV_EVENT_CLICKED, nullptr);
+
+  // Lock/logout button
+  lv_obj_t *btnLock = lv_obj_create(navRow);
+  lv_obj_set_size(btnLock, 30, 26);
+  lv_obj_set_style_bg_color(btnLock, C_PIN_BTN, 0);
+  lv_obj_set_style_bg_opa(btnLock, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(btnLock, 4, 0);
+  lv_obj_set_style_border_width(btnLock, 0, 0);
+  lv_obj_clear_flag(btnLock, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(btnLock, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_t *lIcon = lv_label_create(btnLock);
+  lv_label_set_text(lIcon, LV_SYMBOL_POWER);
+  lv_obj_set_style_text_color(lIcon, C_RED, 0);
+  lv_obj_center(lIcon);
+  lv_obj_add_event_cb(btnLock, logoutCb, LV_EVENT_CLICKED, nullptr);
 
   // === LEFT COLUMN ===
 
   // Camera card
-  lv_obj_t *cc = mkCard(scr, 370, 288);
+  lv_obj_t *cc = mkCard(scrDashboard, 370, 288);
   lv_obj_set_pos(cc, 6, 40);
   lv_obj_set_flex_flow(cc, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_gap(cc, 4, 0);
 
   lv_obj_t *ch = mkRow(cc, 18);
   mkTitle(ch, LV_SYMBOL_VIDEO "  Camera 1");
-  lbl_fps = lv_label_create(ch);
-  lv_label_set_text(lbl_fps, "-- fps");
-  lv_obj_set_style_text_color(lbl_fps, C_GREEN, 0);
+  lblFps = lv_label_create(ch);
+  lv_label_set_text(lblFps, "-- fps");
+  lv_obj_set_style_text_color(lblFps, C_GREEN, 0);
 
-  // Live video image from SDRAM buffer
+  // Video image
   camFrameBuf = (uint16_t *)SDRAM.malloc(CAM_W * CAM_H * sizeof(uint16_t));
   if (camFrameBuf) {
     memset(camFrameBuf, 0, CAM_W * CAM_H * sizeof(uint16_t));
@@ -256,54 +512,48 @@ void buildUI() {
     lv_image_set_src(camImg, &camImgDsc);
     lv_obj_set_style_radius(camImg, 4, 0);
     lv_obj_set_style_clip_corner(camImg, true, 0);
-    Serial.println("Camera canvas: SDRAM OK");
-  } else {
-    lv_obj_t *ph = lv_label_create(cc);
-    lv_label_set_text(ph, "Camera buffer alloc failed");
-    lv_obj_set_style_text_color(ph, C_RED, 0);
-    Serial.println("Camera canvas: SDRAM FAIL");
   }
 
-  lbl_stream_status = lv_label_create(cc);
-  lv_label_set_text(lbl_stream_status, "Waiting for stream...");
-  lv_obj_set_style_text_color(lbl_stream_status, C_TEXT_DIM, 0);
+  lblStreamStatus = lv_label_create(cc);
+  lv_label_set_text(lblStreamStatus, "Connecting...");
+  lv_obj_set_style_text_color(lblStreamStatus, C_TEXT_DIM, 0);
 
-  // IMU Sensor card (GIGA's own BMI270)
-  lv_obj_t *sc = mkCard(scr, 370, 128);
+  // IMU card
+  lv_obj_t *sc = mkCard(scrDashboard, 370, 128);
   lv_obj_set_pos(sc, 6, 334);
   lv_obj_set_flex_flow(sc, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_gap(sc, 3, 0);
 
   mkTitle(sc, LV_SYMBOL_GPS "  GIGA IMU (BMI270)");
-  lbl_accel  = mkDim(sc, "Accel: --");
-  lbl_gyro   = mkDim(sc, "Gyro:  --");
-  lbl_motion = mkDim(sc, "Motion: Idle");
-  lbl_uptime = mkDim(sc, "Uptime: 0s");
+  lblAccel  = lv_label_create(sc); lv_label_set_text(lblAccel, "Accel: --");
+  lv_obj_set_style_text_color(lblAccel, C_TEXT_DIM, 0);
+  lblGyro   = lv_label_create(sc); lv_label_set_text(lblGyro, "Gyro: --");
+  lv_obj_set_style_text_color(lblGyro, C_TEXT_DIM, 0);
+  lblMotion = lv_label_create(sc); lv_label_set_text(lblMotion, "Motion: --");
+  lv_obj_set_style_text_color(lblMotion, C_GREEN, 0);
+  lblUptime = lv_label_create(sc); lv_label_set_text(lblUptime, "Uptime: 0s");
+  lv_obj_set_style_text_color(lblUptime, C_TEXT_DIM, 0);
 
   // === RIGHT COLUMN ===
 
   // Door locks
-  lv_obj_t *lc = mkCard(scr, 412, 178);
+  lv_obj_t *lc = mkCard(scrDashboard, 412, 178);
   lv_obj_set_pos(lc, 382, 40);
   lv_obj_set_flex_flow(lc, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_gap(lc, 6, 0);
   mkTitle(lc, LV_SYMBOL_CLOSE "  Door Locks");
-  mkDoorRow(lc, "Front Door", &sw_front_door, &led_front, frontDoorLocked);
-  mkDoorRow(lc, "Back Door",  &sw_back_door,  &led_back,  backDoorLocked);
-  mkDoorRow(lc, "Garage",     &sw_garage,     &led_garage, garageLocked);
+  for (int i = 0; i < 3; i++) mkDoorRow(lc, i);
 
   // Windows
-  lv_obj_t *wc = mkCard(scr, 412, 144);
+  lv_obj_t *wc = mkCard(scrDashboard, 412, 144);
   lv_obj_set_pos(wc, 382, 224);
   lv_obj_set_flex_flow(wc, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_gap(wc, 4, 0);
   mkTitle(wc, LV_SYMBOL_WARNING "  Window Sensors");
-  mkWinRow(wc, "Living Room", &led_win_living,  &lbl_win_living,  windowLiving);
-  mkWinRow(wc, "Bedroom",     &led_win_bedroom, &lbl_win_bedroom, windowBedroom);
-  mkWinRow(wc, "Kitchen",     &led_win_kitchen, &lbl_win_kitchen, windowKitchen);
+  for (int i = 0; i < 3; i++) mkWinRow(wc, i);
 
   // System card
-  lv_obj_t *sysc = mkCard(scr, 412, 92);
+  lv_obj_t *sysc = mkCard(scrDashboard, 412, 92);
   lv_obj_set_pos(sysc, 382, 374);
   lv_obj_set_flex_flow(sysc, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_gap(sysc, 4, 0);
@@ -312,15 +562,262 @@ void buildUI() {
   lv_obj_set_style_pad_column(ar, 8, 0);
   lv_obj_set_flex_align(ar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   lv_obj_t *al = lv_led_create(ar);
-  lv_led_set_color(al, C_GREEN);
-  lv_led_set_brightness(al, 200);
-  lv_obj_set_size(al, 10, 10);
+  lv_led_set_color(al, C_GREEN); lv_led_set_brightness(al, 200); lv_obj_set_size(al, 10, 10);
   lv_obj_t *at = lv_label_create(ar);
   lv_label_set_text(at, "System Armed - All Active");
   lv_obj_set_style_text_color(at, C_GREEN, 0);
 }
 
-// --- WiFi ---
+// ============================================================
+// PAGE 3: SETTINGS
+// ============================================================
+
+static void backToDashCb(lv_event_t *e) {
+  touchActivity();
+  currentPage = PAGE_DASHBOARD;
+  lv_screen_load_anim(scrDashboard, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
+  Serial.println("Settings -> Dashboard");
+}
+
+static void motionSliderCb(lv_event_t *e) {
+  touchActivity();
+  settings.motionThreshold = lv_slider_get_value((lv_obj_t *)lv_event_get_target(e));
+  char buf[16]; snprintf(buf, sizeof(buf), "%d%%", settings.motionThreshold);
+  lv_label_set_text(lblMotionVal, buf);
+}
+
+static void autoLockSliderCb(lv_event_t *e) {
+  touchActivity();
+  settings.autoLockSecs = lv_slider_get_value((lv_obj_t *)lv_event_get_target(e));
+  char buf[16]; snprintf(buf, sizeof(buf), "%ds", settings.autoLockSecs);
+  lv_label_set_text(lblAutoLockVal, buf);
+}
+
+static void fpsSliderCb(lv_event_t *e) {
+  touchActivity();
+  settings.targetFps = lv_slider_get_value((lv_obj_t *)lv_event_get_target(e));
+  char buf[16]; snprintf(buf, sizeof(buf), "%d fps", settings.targetFps);
+  lv_label_set_text(lblFpsVal, buf);
+}
+
+static void qualitySliderCb(lv_event_t *e) {
+  touchActivity();
+  settings.jpegQuality = lv_slider_get_value((lv_obj_t *)lv_event_get_target(e));
+  char buf[16]; snprintf(buf, sizeof(buf), "%d", settings.jpegQuality);
+  lv_label_set_text(lblQualityVal, buf);
+}
+
+static void pinChangeCb(lv_event_t *e) {
+  touchActivity();
+  const char *newPin = lv_textarea_get_text(taNewPin);
+  if (strlen(newPin) == 4) {
+    strncpy(settings.pin, newPin, 4);
+    settings.pin[4] = '\0';
+    lv_textarea_set_text(taNewPin, "");
+    Serial.print("PIN changed to: "); Serial.println(settings.pin);
+  }
+}
+
+static lv_obj_t *mkSettingRow(lv_obj_t *parent, const char *label, int sliderMin, int sliderMax,
+                               int sliderVal, lv_obj_t **sliderOut, lv_obj_t **valLblOut,
+                               lv_event_cb_t cb) {
+  lv_obj_t *row = lv_obj_create(parent);
+  lv_obj_set_size(row, lv_pct(100), 44);
+  lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(row, 0, 0);
+  lv_obj_set_style_pad_all(row, 0, 0);
+  lv_obj_set_style_pad_column(row, 10, 0);
+  lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *lbl = lv_label_create(row);
+  lv_label_set_text(lbl, label);
+  lv_obj_set_style_text_color(lbl, C_TEXT, 0);
+  lv_obj_set_size(lbl, 140, LV_SIZE_CONTENT);
+
+  *sliderOut = lv_slider_create(row);
+  lv_slider_set_range(*sliderOut, sliderMin, sliderMax);
+  lv_slider_set_value(*sliderOut, sliderVal, LV_ANIM_OFF);
+  lv_obj_set_size(*sliderOut, 160, 10);
+  lv_obj_set_style_bg_color(*sliderOut, C_BORDER, 0);
+  lv_obj_set_style_bg_color(*sliderOut, C_ACCENT, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(*sliderOut, C_ACCENT, LV_PART_KNOB);
+  lv_obj_add_event_cb(*sliderOut, cb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  *valLblOut = lv_label_create(row);
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%d", sliderVal);
+  lv_label_set_text(*valLblOut, buf);
+  lv_obj_set_style_text_color(*valLblOut, C_ACCENT, 0);
+
+  return row;
+}
+
+void buildSettingsPage() {
+  scrSettings = lv_obj_create(nullptr);
+  lv_obj_set_style_bg_color(scrSettings, C_BG, 0);
+
+  // Top bar
+  lv_obj_t *top = lv_obj_create(scrSettings);
+  lv_obj_set_size(top, 800, 34);
+  lv_obj_set_pos(top, 0, 0);
+  lv_obj_set_style_bg_color(top, C_CARD, 0);
+  lv_obj_set_style_bg_opa(top, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(top, 0, 0);
+  lv_obj_set_style_radius(top, 0, 0);
+  lv_obj_set_style_pad_hor(top, 12, 0);
+  lv_obj_clear_flag(top, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(top, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(top, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(top, 10, 0);
+
+  // Back button
+  lv_obj_t *btnBack = lv_obj_create(top);
+  lv_obj_set_size(btnBack, 30, 26);
+  lv_obj_set_style_bg_color(btnBack, C_PIN_BTN, 0);
+  lv_obj_set_style_bg_opa(btnBack, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(btnBack, 4, 0);
+  lv_obj_set_style_border_width(btnBack, 0, 0);
+  lv_obj_clear_flag(btnBack, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(btnBack, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_t *bIcon = lv_label_create(btnBack);
+  lv_label_set_text(bIcon, LV_SYMBOL_LEFT);
+  lv_obj_set_style_text_color(bIcon, C_TEXT, 0);
+  lv_obj_center(bIcon);
+  lv_obj_add_event_cb(btnBack, backToDashCb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *titleLbl = lv_label_create(top);
+  lv_label_set_text(titleLbl, LV_SYMBOL_SETTINGS "  Settings");
+  lv_obj_set_style_text_color(titleLbl, C_TEXT, 0);
+
+  // === LEFT: Camera & Security Settings ===
+  lv_obj_t *leftCard = mkCard(scrSettings, 380, 420);
+  lv_obj_set_pos(leftCard, 6, 42);
+  lv_obj_set_flex_flow(leftCard, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_gap(leftCard, 6, 0);
+
+  mkTitle(leftCard, LV_SYMBOL_VIDEO "  Camera");
+
+  char fpsBuf[16]; snprintf(fpsBuf, sizeof(fpsBuf), "%d fps", settings.targetFps);
+  mkSettingRow(leftCard, "Target FPS", 5, 30, settings.targetFps, &sliderFps, &lblFpsVal, fpsSliderCb);
+  lv_label_set_text(lblFpsVal, fpsBuf);
+
+  char qualBuf[16]; snprintf(qualBuf, sizeof(qualBuf), "%d", settings.jpegQuality);
+  mkSettingRow(leftCard, "JPEG Quality", 5, 63, settings.jpegQuality, &sliderQuality, &lblQualityVal, qualitySliderCb);
+  lv_label_set_text(lblQualityVal, qualBuf);
+
+  // Divider
+  lv_obj_t *div1 = lv_obj_create(leftCard);
+  lv_obj_set_size(div1, lv_pct(100), 1);
+  lv_obj_set_style_bg_color(div1, C_BORDER, 0);
+  lv_obj_set_style_bg_opa(div1, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(div1, 0, 0);
+  lv_obj_clear_flag(div1, LV_OBJ_FLAG_SCROLLABLE);
+
+  mkTitle(leftCard, LV_SYMBOL_EYE_OPEN "  Security");
+
+  char motBuf[16]; snprintf(motBuf, sizeof(motBuf), "%d%%", settings.motionThreshold);
+  mkSettingRow(leftCard, "Motion Sens.", 10, 100, settings.motionThreshold, &sliderMotion, &lblMotionVal, motionSliderCb);
+  lv_label_set_text(lblMotionVal, motBuf);
+
+  char alBuf[16]; snprintf(alBuf, sizeof(alBuf), "%ds", settings.autoLockSecs);
+  mkSettingRow(leftCard, "Auto-Lock", 30, 600, settings.autoLockSecs, &sliderAutoLock, &lblAutoLockVal, autoLockSliderCb);
+  lv_label_set_text(lblAutoLockVal, alBuf);
+
+  // Divider
+  lv_obj_t *div2 = lv_obj_create(leftCard);
+  lv_obj_set_size(div2, lv_pct(100), 1);
+  lv_obj_set_style_bg_color(div2, C_BORDER, 0);
+  lv_obj_set_style_bg_opa(div2, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(div2, 0, 0);
+  lv_obj_clear_flag(div2, LV_OBJ_FLAG_SCROLLABLE);
+
+  mkTitle(leftCard, LV_SYMBOL_EDIT "  Change PIN");
+
+  lv_obj_t *pinRow = lv_obj_create(leftCard);
+  lv_obj_set_size(pinRow, lv_pct(100), 40);
+  lv_obj_set_style_bg_opa(pinRow, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(pinRow, 0, 0);
+  lv_obj_set_style_pad_all(pinRow, 0, 0);
+  lv_obj_set_style_pad_column(pinRow, 8, 0);
+  lv_obj_set_flex_flow(pinRow, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(pinRow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_clear_flag(pinRow, LV_OBJ_FLAG_SCROLLABLE);
+
+  taNewPin = lv_textarea_create(pinRow);
+  lv_textarea_set_max_length(taNewPin, 4);
+  lv_textarea_set_one_line(taNewPin, true);
+  lv_textarea_set_password_mode(taNewPin, true);
+  lv_textarea_set_placeholder_text(taNewPin, "New PIN");
+  lv_obj_set_size(taNewPin, 120, 36);
+  lv_obj_set_style_bg_color(taNewPin, C_PIN_BTN, 0);
+  lv_obj_set_style_text_color(taNewPin, C_TEXT, 0);
+  lv_obj_set_style_border_color(taNewPin, C_BORDER, 0);
+
+  lv_obj_t *btnSavePin = lv_obj_create(pinRow);
+  lv_obj_set_size(btnSavePin, 60, 32);
+  lv_obj_set_style_bg_color(btnSavePin, C_ACCENT, 0);
+  lv_obj_set_style_bg_opa(btnSavePin, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(btnSavePin, 6, 0);
+  lv_obj_set_style_border_width(btnSavePin, 0, 0);
+  lv_obj_clear_flag(btnSavePin, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(btnSavePin, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_t *saveLbl = lv_label_create(btnSavePin);
+  lv_label_set_text(saveLbl, "Save");
+  lv_obj_set_style_text_color(saveLbl, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_center(saveLbl);
+  lv_obj_add_event_cb(btnSavePin, pinChangeCb, LV_EVENT_CLICKED, nullptr);
+
+  // === RIGHT: WiFi & System Info ===
+  lv_obj_t *rightCard = mkCard(scrSettings, 400, 200);
+  lv_obj_set_pos(rightCard, 392, 42);
+  lv_obj_set_flex_flow(rightCard, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_gap(rightCard, 6, 0);
+
+  mkTitle(rightCard, LV_SYMBOL_WIFI "  Network");
+
+  lblSettingsWifi = lv_label_create(rightCard);
+  lv_label_set_text(lblSettingsWifi, "SSID: --\nIP: --\nStatus: --");
+  lv_obj_set_style_text_color(lblSettingsWifi, C_TEXT_DIM, 0);
+
+  // System info card
+  lv_obj_t *sysCard = mkCard(scrSettings, 400, 210);
+  lv_obj_set_pos(sysCard, 392, 250);
+  lv_obj_set_flex_flow(sysCard, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_gap(sysCard, 6, 0);
+
+  mkTitle(sysCard, LV_SYMBOL_DRIVE "  System Info");
+
+  lblSysFw = lv_label_create(sysCard);
+  lv_label_set_text(lblSysFw, "Firmware: GigaSenseHub v1.0");
+  lv_obj_set_style_text_color(lblSysFw, C_TEXT_DIM, 0);
+
+  lblSysUptime = lv_label_create(sysCard);
+  lv_label_set_text(lblSysUptime, "Uptime: 0s");
+  lv_obj_set_style_text_color(lblSysUptime, C_TEXT_DIM, 0);
+
+  lblSysMem = lv_label_create(sysCard);
+  lv_label_set_text(lblSysMem, "Free heap: --");
+  lv_obj_set_style_text_color(lblSysMem, C_TEXT_DIM, 0);
+
+  lv_obj_t *camInfo = lv_label_create(sysCard);
+  lv_label_set_text(camInfo, "Camera: ESP32-S3 Sense (QVGA)");
+  lv_obj_set_style_text_color(camInfo, C_TEXT_DIM, 0);
+
+  lv_obj_t *imuInfo = lv_label_create(sysCard);
+  lv_label_set_text(imuInfo, "IMU: BMI270 (Wire1)");
+  lv_obj_set_style_text_color(imuInfo, C_TEXT_DIM, 0);
+
+  lv_obj_t *dispInfo = lv_label_create(sysCard);
+  lv_label_set_text(dispInfo, "Display: 800x480 LVGL 9");
+  lv_obj_set_style_text_color(dispInfo, C_TEXT_DIM, 0);
+}
+
+// ============================================================
+// WiFi & Stream
+// ============================================================
+
 void connectWiFi() {
   WiFi.begin(AP_SSID, AP_PASSWORD);
   int att = 0;
@@ -329,7 +826,6 @@ void connectWiFi() {
   if (wifiConnected) { Serial.print("WiFi OK: "); Serial.println(WiFi.localIP()); }
 }
 
-// --- Stream ---
 bool connectStream() {
   if (streamClient.connected()) return true;
   IPAddress ip; ip.fromString(ESP32_IP);
@@ -376,68 +872,101 @@ bool readFrame() {
   return true;
 }
 
-// --- Update UI ---
-void updateUI() {
-  char buf[64];
-  snprintf(buf, sizeof(buf), "%.1f fps", currentFps);
-  lv_label_set_text(lbl_fps, buf);
+// ============================================================
+// UI Update (Dashboard)
+// ============================================================
 
-  lv_label_set_text(lbl_stream_status, streamConnected ? LV_SYMBOL_PLAY " LIVE" : "Offline");
-  lv_obj_set_style_text_color(lbl_stream_status, streamConnected ? C_GREEN : C_RED, 0);
+void updateDashboardUI() {
+  if (currentPage != PAGE_DASHBOARD) return;
+  char buf[64];
+
+  snprintf(buf, sizeof(buf), "%.1f fps", currentFps);
+  lv_label_set_text(lblFps, buf);
+
+  lv_label_set_text(lblStreamStatus, streamConnected ? LV_SYMBOL_PLAY " LIVE" : "Offline");
+  lv_obj_set_style_text_color(lblStreamStatus, streamConnected ? C_GREEN : C_RED, 0);
 
   if (wifiConnected) {
     snprintf(buf, sizeof(buf), LV_SYMBOL_WIFI " %s | %s",
              WiFi.localIP().toString().c_str(), streamConnected ? "LIVE" : "NO STREAM");
-    lv_label_set_text(lbl_status_bar, buf);
-    lv_obj_set_style_text_color(lbl_status_bar, streamConnected ? C_GREEN : C_ORANGE, 0);
+    lv_label_set_text(lblStatusBar, buf);
+    lv_obj_set_style_text_color(lblStatusBar, streamConnected ? C_GREEN : C_ORANGE, 0);
   }
 
-  // GIGA IMU data — always update labels
+  // IMU
   snprintf(buf, sizeof(buf), "Accel: X:%.2f  Y:%.2f  Z:%.2f g", accelX, accelY, accelZ);
-  lv_label_set_text(lbl_accel, buf);
+  lv_label_set_text(lblAccel, buf);
   snprintf(buf, sizeof(buf), "Gyro:  X:%.1f  Y:%.1f  Z:%.1f dps", gyroX, gyroY, gyroZ);
-  lv_label_set_text(lbl_gyro, buf);
+  lv_label_set_text(lblGyro, buf);
 
   float totalAccel = abs(accelX) + abs(accelY) + abs(accelZ);
   float totalGyro = abs(gyroX) + abs(gyroY) + abs(gyroZ);
-  const char *motion;
-  lv_color_t motionColor;
-  if (totalGyro > 100 || totalAccel > 2.0f) {
-    motion = "Motion: ALERT!"; motionColor = C_RED;
-  } else if (totalGyro > 30 || totalAccel > 1.3f) {
-    motion = "Motion: Vibration"; motionColor = C_ORANGE;
+  float motThresh = settings.motionThreshold / 50.0f;
+
+  const char *motion; lv_color_t mc;
+  if (totalGyro > 100 * motThresh || totalAccel > 2.0f * motThresh) {
+    motion = "Motion: ALERT!"; mc = C_RED;
+  } else if (totalGyro > 30 * motThresh || totalAccel > 1.3f * motThresh) {
+    motion = "Motion: Vibration"; mc = C_ORANGE;
   } else {
-    motion = imuReady ? "Motion: Idle" : "IMU: Not detected";
-    motionColor = imuReady ? C_GREEN : C_RED;
+    motion = imuReady ? "Motion: Idle" : "IMU: Not detected"; mc = imuReady ? C_GREEN : C_RED;
   }
-  lv_label_set_text(lbl_motion, motion);
-  lv_obj_set_style_text_color(lbl_motion, motionColor, 0);
+  lv_label_set_text(lblMotion, motion);
+  lv_obj_set_style_text_color(lblMotion, mc, 0);
 
   unsigned long secs = millis() / 1000;
   snprintf(buf, sizeof(buf), "Uptime: %lum %lus", secs / 60, secs % 60);
-  lv_label_set_text(lbl_uptime, buf);
+  lv_label_set_text(lblUptime, buf);
 
-  windowLiving = (totalAccel > 1.5f);
-  windowKitchen = (abs(gyroX) > 50.0f);
-  windowBedroom = (abs(gyroY) > 50.0f);
-
-  auto updWin = [](lv_obj_t *led, lv_obj_t *lbl, bool open) {
-    lv_led_set_color(led, open ? C_ORANGE : C_GREEN);
-    lv_label_set_text(lbl, open ? "OPEN" : "CLOSED");
-    lv_obj_set_style_text_color(lbl, open ? C_ORANGE : C_GREEN, 0);
-  };
-  updWin(led_win_living,  lbl_win_living,  windowLiving);
-  updWin(led_win_bedroom, lbl_win_bedroom, windowBedroom);
-  updWin(led_win_kitchen, lbl_win_kitchen, windowKitchen);
+  // Window sensors
+  windowOpen[0] = (totalAccel > 1.5f);
+  windowOpen[1] = (abs(gyroY) > 50.0f);
+  windowOpen[2] = (abs(gyroX) > 50.0f);
+  for (int i = 0; i < 3; i++) {
+    lv_led_set_color(ledWin[i], windowOpen[i] ? C_ORANGE : C_GREEN);
+    lv_label_set_text(lblWin[i], windowOpen[i] ? "OPEN" : "CLOSED");
+    lv_obj_set_style_text_color(lblWin[i], windowOpen[i] ? C_ORANGE : C_GREEN, 0);
+  }
 }
 
-// --- Setup ---
+extern "C" char *sbrk(int incr);
+static unsigned long freeMemory() {
+  char top;
+  return (unsigned long)(&top - reinterpret_cast<char*>(sbrk(0)));
+}
+
+void updateSettingsUI() {
+  if (currentPage != PAGE_SETTINGS) return;
+  char buf[128];
+
+  if (wifiConnected) {
+    snprintf(buf, sizeof(buf), "SSID: %s\nIP: %s\nStatus: Connected", AP_SSID, WiFi.localIP().toString().c_str());
+  } else {
+    snprintf(buf, sizeof(buf), "SSID: %s\nIP: --\nStatus: Disconnected", AP_SSID);
+  }
+  lv_label_set_text(lblSettingsWifi, buf);
+
+  unsigned long secs = millis() / 1000;
+  snprintf(buf, sizeof(buf), "Uptime: %luh %lum %lus", secs / 3600, (secs % 3600) / 60, secs % 60);
+  lv_label_set_text(lblSysUptime, buf);
+
+  snprintf(buf, sizeof(buf), "Free heap: %lu bytes", (unsigned long)freeMemory());
+  lv_label_set_text(lblSysMem, buf);
+}
+
+// ============================================================
+// Setup
+// ============================================================
+
 void setup() {
-  Serial.begin(115200); delay(1000);
-  Serial.println("\n=== GigaSenseHub Security ===");
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n=== GigaSenseHub Security App ===");
+
   display.begin();
   Serial.println("Display OK");
   touchCtrl.begin();
+
   if (myIMU.begin()) {
     myIMU.setContinuousMode();
     imuReady = true; imuOnWire1 = true;
@@ -449,59 +978,86 @@ void setup() {
   } else {
     Serial.println("IMU failed");
   }
-  buildUI();
+
+  // Build all pages
+  buildLoginPage();
+  buildDashboardPage();
+  buildSettingsPage();
+
+  // Start on login
+  lv_screen_load(scrLogin);
   lv_timer_handler();
+
   connectWiFi();
   delay(2000);
+
+  lastActivity = millis();
   lastFpsCalc = millis();
-  Serial.println("Ready");
+  Serial.println("App ready");
 }
 
-// --- Loop ---
+// ============================================================
+// Main Loop
+// ============================================================
+
 void loop() {
   unsigned long now = millis();
   lv_timer_handler();
 
+  // WiFi maintenance
   if (WiFi.status() != WL_CONNECTED) {
     wifiConnected = false; streamConnected = false;
-    connectWiFi(); return;
-  }
-  if (!streamConnected) { connectStream(); if (!streamConnected) { delay(2000); return; } }
-
-  if (streamConnected && readFrame()) {
-    if (camFrameBuf) decodeFrame();
-    frameCount++;
+    connectWiFi();
+    return;
   }
 
+  // Stream (only process when on dashboard)
+  if (currentPage == PAGE_DASHBOARD) {
+    if (!streamConnected) {
+      connectStream();
+      if (!streamConnected) { delay(2000); return; }
+    }
+    if (streamConnected && readFrame()) {
+      if (camFrameBuf) decodeFrame();
+      frameCount++;
+    }
+  }
+
+  // FPS calc
   if (now - lastFpsCalc >= 1000) {
     currentFps = frameCount * 1000.0f / (now - lastFpsCalc);
     frameCount = 0; lastFpsCalc = now;
-    char lb[120];
-    snprintf(lb, sizeof(lb), "FPS: %.1f | Stream: %s | IMU:%s A:%.2f,%.2f,%.2f",
-             currentFps, streamConnected ? "OK" : "NO",
-             imuReady ? "Y" : "N", accelX, accelY, accelZ);
+    char lb[80];
+    snprintf(lb, sizeof(lb), "FPS: %.1f | Page: %d | Stream: %s",
+             currentFps, currentPage, streamConnected ? "OK" : "NO");
     Serial.println(lb);
   }
 
+  // IMU read
   static unsigned long lastIMU = 0;
   if (now - lastIMU >= 50) {
     BoschSensorClass &imu = imuOnWire1 ? myIMU : IMU;
-    int accAvail = imu.accelerationAvailable();
-    int gyroAvail = imu.gyroscopeAvailable();
-    if (accAvail) imu.readAcceleration(accelX, accelY, accelZ);
-    if (gyroAvail) imu.readGyroscope(gyroX, gyroY, gyroZ);
-    // Debug: log availability once per second
-    static unsigned long lastIMUDbg = 0;
-    if (now - lastIMUDbg >= 2000) {
-      char db[80];
-      snprintf(db, sizeof(db), "IMU avail: acc=%d gyro=%d vals=%.2f,%.2f,%.2f",
-               accAvail, gyroAvail, accelX, accelY, accelZ);
-      Serial.println(db);
-      lastIMUDbg = now;
-    }
+    if (imu.accelerationAvailable()) imu.readAcceleration(accelX, accelY, accelZ);
+    if (imu.gyroscopeAvailable()) imu.readGyroscope(gyroX, gyroY, gyroZ);
     lastIMU = now;
   }
 
+  // UI updates
   static unsigned long lastUI = 0;
-  if (now - lastUI >= 500) { updateUI(); lastUI = now; }
+  if (now - lastUI >= 500) {
+    updateDashboardUI();
+    updateSettingsUI();
+    lastUI = now;
+  }
+
+  // Auto-lock
+  if (currentPage != PAGE_LOGIN && settings.autoLockSecs > 0) {
+    if (now - lastActivity > (unsigned long)settings.autoLockSecs * 1000) {
+      currentPage = PAGE_LOGIN;
+      pinClear();
+      lv_screen_load_anim(scrLogin, LV_SCR_LOAD_ANIM_FADE_ON, 500, 0, false);
+      Serial.println("Auto-lock -> Login");
+      lastActivity = now;
+    }
+  }
 }
