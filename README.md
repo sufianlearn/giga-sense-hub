@@ -2,7 +2,11 @@
 
 Wireless home security dashboard — ESP32-S3 camera streams live video to an Arduino GIGA R1 running a professional LVGL 9 touchscreen UI.
 
-![Dashboard](assets/giga-display.jpeg)
+<p align="center">
+  <img src="assets/lock-screen.jpeg" width="250" />
+  <img src="assets/main-screen.jpeg" width="250" />
+  <img src="assets/settings-screen.jpeg" width="250" />
+</p>
 
 ## How It Works
 
@@ -52,7 +56,7 @@ Power both boards. The GIGA connects to the ESP32's AP automatically. Enter PIN 
 ├── esp32-sensor-node/       # Camera firmware (WiFi AP + MJPEG stream)
 ├── giga-display-hub/        # Dashboard firmware (LVGL 9 + JPEG decode + IMU)
 ├── shared/protocol.h        # Network config shared by both boards
-└── assets/                  # Images
+└── assets/                  # Screenshots
 ```
 
 ## Network
