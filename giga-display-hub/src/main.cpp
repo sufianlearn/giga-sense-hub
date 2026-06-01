@@ -135,8 +135,10 @@ static int tjpg_output(JDEC *jd, void *bmp, JRECT *r) {
   if (!camFrameBuf) return 0;
   for (int y = r->top; y <= r->bottom; y++)
     for (int x = r->left; x <= r->right; x++) {
-      if ((unsigned)x < CAM_W && (unsigned)y < CAM_H)
-        camFrameBuf[y * CAM_W + x] = *px;
+      if ((unsigned)x < CAM_W && (unsigned)y < CAM_H) {
+        uint16_t c = *px;
+        camFrameBuf[y * CAM_W + x] = (c >> 8) | (c << 8);
+      }
       px++;
     }
   return 1;
@@ -453,12 +455,13 @@ void buildDashboardPage() {
   lv_obj_set_flex_flow(navRow, LV_FLEX_FLOW_ROW);
   lv_obj_clear_flag(navRow, LV_OBJ_FLAG_SCROLLABLE);
 
-  // Settings button
+  // Settings button (large touch target)
   lv_obj_t *btnSettings = lv_obj_create(navRow);
-  lv_obj_set_size(btnSettings, 30, 26);
+  lv_obj_set_size(btnSettings, 60, 30);
   lv_obj_set_style_bg_color(btnSettings, C_PIN_BTN, 0);
+  lv_obj_set_style_bg_color(btnSettings, C_PIN_BTN_PR, LV_STATE_PRESSED);
   lv_obj_set_style_bg_opa(btnSettings, LV_OPA_COVER, 0);
-  lv_obj_set_style_radius(btnSettings, 4, 0);
+  lv_obj_set_style_radius(btnSettings, 6, 0);
   lv_obj_set_style_border_width(btnSettings, 0, 0);
   lv_obj_clear_flag(btnSettings, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(btnSettings, LV_OBJ_FLAG_CLICKABLE);
@@ -468,12 +471,13 @@ void buildDashboardPage() {
   lv_obj_center(sIcon);
   lv_obj_add_event_cb(btnSettings, gotoSettingsCb, LV_EVENT_CLICKED, nullptr);
 
-  // Lock/logout button
+  // Lock/logout button (large touch target)
   lv_obj_t *btnLock = lv_obj_create(navRow);
-  lv_obj_set_size(btnLock, 30, 26);
+  lv_obj_set_size(btnLock, 60, 30);
   lv_obj_set_style_bg_color(btnLock, C_PIN_BTN, 0);
+  lv_obj_set_style_bg_color(btnLock, C_PIN_BTN_PR, LV_STATE_PRESSED);
   lv_obj_set_style_bg_opa(btnLock, LV_OPA_COVER, 0);
-  lv_obj_set_style_radius(btnLock, 4, 0);
+  lv_obj_set_style_radius(btnLock, 6, 0);
   lv_obj_set_style_border_width(btnLock, 0, 0);
   lv_obj_clear_flag(btnLock, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(btnLock, LV_OBJ_FLAG_CLICKABLE);
@@ -672,9 +676,9 @@ void buildSettingsPage() {
   lv_obj_set_flex_align(top, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   lv_obj_set_style_pad_column(top, 10, 0);
 
-  // Back button
+  // Back button (large touch target)
   lv_obj_t *btnBack = lv_obj_create(top);
-  lv_obj_set_size(btnBack, 30, 26);
+  lv_obj_set_size(btnBack, 60, 30);
   lv_obj_set_style_bg_color(btnBack, C_PIN_BTN, 0);
   lv_obj_set_style_bg_opa(btnBack, LV_OPA_COVER, 0);
   lv_obj_set_style_radius(btnBack, 4, 0);
@@ -988,12 +992,10 @@ void setup() {
   lv_screen_load(scrLogin);
   lv_timer_handler();
 
-  connectWiFi();
-  delay(2000);
-
+  // Connect WiFi in background — don't block the login screen
   lastActivity = millis();
   lastFpsCalc = millis();
-  Serial.println("App ready");
+  Serial.println("App ready — WiFi connects on dashboard entry");
 }
 
 // ============================================================
@@ -1004,22 +1006,30 @@ void loop() {
   unsigned long now = millis();
   lv_timer_handler();
 
-  // WiFi maintenance
-  if (WiFi.status() != WL_CONNECTED) {
-    wifiConnected = false; streamConnected = false;
-    connectWiFi();
-    return;
-  }
-
-  // Stream (only process when on dashboard)
+  // WiFi + Stream — only when on dashboard, non-blocking for other pages
   if (currentPage == PAGE_DASHBOARD) {
-    if (!streamConnected) {
-      connectStream();
-      if (!streamConnected) { delay(2000); return; }
-    }
-    if (streamConnected && readFrame()) {
-      if (camFrameBuf) decodeFrame();
-      frameCount++;
+    if (WiFi.status() != WL_CONNECTED) {
+      if (!wifiConnected) {
+        // Start WiFi connect (non-blocking check each loop)
+        static bool wifiStarted = false;
+        if (!wifiStarted) { WiFi.begin(AP_SSID, AP_PASSWORD); wifiStarted = true; }
+        if (WiFi.status() == WL_CONNECTED) {
+          wifiConnected = true; wifiStarted = false;
+          Serial.print("WiFi OK: "); Serial.println(WiFi.localIP());
+        }
+      } else {
+        wifiConnected = false; streamConnected = false;
+        WiFi.begin(AP_SSID, AP_PASSWORD);
+      }
+    } else {
+      wifiConnected = true;
+      if (!streamConnected) {
+        connectStream();
+      }
+      if (streamConnected && readFrame()) {
+        if (camFrameBuf) decodeFrame();
+        frameCount++;
+      }
     }
   }
 
@@ -1050,14 +1060,15 @@ void loop() {
     lastUI = now;
   }
 
-  // Auto-lock
-  if (currentPage != PAGE_LOGIN && settings.autoLockSecs > 0) {
-    if (now - lastActivity > (unsigned long)settings.autoLockSecs * 1000) {
+  // Auto-lock: use LVGL's own inactivity tracker (immune to blocking calls)
+  // lv_display_get_inactive_time returns ms since last touch input
+  if (currentPage == PAGE_DASHBOARD || currentPage == PAGE_SETTINGS) {
+    uint32_t idleMs = lv_display_get_inactive_time(NULL);
+    if (settings.autoLockSecs > 0 && idleMs > (uint32_t)settings.autoLockSecs * 1000) {
       currentPage = PAGE_LOGIN;
       pinClear();
       lv_screen_load_anim(scrLogin, LV_SCR_LOAD_ANIM_FADE_ON, 500, 0, false);
       Serial.println("Auto-lock -> Login");
-      lastActivity = now;
     }
   }
 }
