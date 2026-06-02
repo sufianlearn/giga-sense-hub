@@ -1058,17 +1058,19 @@ void connectWiFi() {
 }
 
 // Scan for camera nodes on the AP network
+// Non-destructive: only updates nodes that respond, marks unreachable ones inactive
 void scanForNodes() {
   WiFiClient probe;
-  probe.setTimeout(1000);  // 1-second connect timeout
-  activeNodeCount = 0;
+  probe.setTimeout(500);  // Short timeout — we're blocking the main loop
+  int foundCount = 0;
   for (int i = 0; i < MAX_NODES; i++) {
     IPAddress ip(192, 168, 3, 2 + i);
+    probe.stop();
     if (probe.connect(ip, STREAM_PORT)) {
       probe.print("GET " NODE_INFO_PATH " HTTP/1.0\r\nHost: ");
       probe.print(ip); probe.print("\r\n\r\n");
       unsigned long t = millis();
-      while (!probe.available() && millis() - t < 1000) delay(10);
+      while (!probe.available() && millis() - t < 800) delay(5);
       // Read response
       String body = "";
       bool hdr = true;
@@ -1084,26 +1086,36 @@ void scanForNodes() {
       if (nidIdx >= 0) {
         int nid = body.substring(nidIdx + 9, body.indexOf(',', nidIdx + 9)).toInt();
         if (nid >= 0 && nid < MAX_NODES) {
+          if (!nodes[nid].active) {
+            Serial.print("Found node "); Serial.print(nid);
+            Serial.print(" at "); Serial.println(ip);
+          }
           nodes[nid].active = true;
           nodes[nid].ip = ip;
           nodes[nid].nodeId = nid;
-          activeNodeCount++;
+          foundCount++;
 
           // Parse RSSI
           int rIdx = body.indexOf("\"rssi\":");
           if (rIdx >= 0) nodes[nid].rssi = body.substring(rIdx + 7, body.indexOf(',', rIdx)).toInt();
-
-          Serial.print("Found node "); Serial.print(nid);
-          Serial.print(" at "); Serial.println(ip);
         }
       }
     } else {
-      if (nodes[i].active) {
-        Serial.print("Node "); Serial.print(i); Serial.println(" lost");
+      // Mark this IP-slot's node inactive only if it was mapped here
+      // Don't reset nodes found at different IPs
+      for (int n = 0; n < MAX_NODES; n++) {
+        if (nodes[n].active && nodes[n].ip == ip) {
+          Serial.print("Node "); Serial.print(n); Serial.println(" lost");
+          nodes[n].active = false;
+          nodes[n].streamConnected = false;
+        }
       }
-      nodes[i].active = false;
-      nodes[i].streamConnected = false;
     }
+  }
+  activeNodeCount = foundCount;
+  // Auto-select first active node for streaming
+  for (int i = 0; i < MAX_NODES; i++) {
+    if (nodes[i].active) { activeNodeIdx = i; break; }
   }
 }
 
@@ -1384,8 +1396,8 @@ void loop() {
   unsigned long now = millis();
   lv_timer_handler();
 
-  // Node scan — runs on any page (nodes connect asynchronously)
-  if (wifiConnected && (now - lastNodeScan >= 30000 || lastNodeScan == 0)) {
+  // Node scan — only when NOT actively streaming (scan blocks main loop)
+  if (wifiConnected && !streamConnected && (now - lastNodeScan >= 10000 || lastNodeScan == 0)) {
     scanForNodes();
     lastNodeScan = now;
   }
@@ -1419,9 +1431,11 @@ void loop() {
     currentFps = frameCount * 1000.0f / (now - lastFpsCalc);
     frameCount = 0; lastFpsCalc = now;
     char lb[80];
-    snprintf(lb, sizeof(lb), "FPS: %.1f | Page: %d | Stream: %s | Nodes: %d | WiFi: %s",
+    snprintf(lb, sizeof(lb), "FPS: %.1f | Page: %d | Stream: %s | Nodes: %d | WiFi: %s | N0:%s N1:%s | SIdx:%d",
              currentFps, currentPage, streamConnected ? "OK" : "NO",
-             activeNodeCount, wifiConnected ? "AP" : "OFF");
+             activeNodeCount, wifiConnected ? "AP" : "OFF",
+             nodes[0].active ? "Y" : "N", nodes[1].active ? "Y" : "N",
+             activeNodeIdx);
     Serial.println(lb);
   }
 
@@ -1434,8 +1448,8 @@ void loop() {
     lastIMU = now;
   }
 
-  // Poll camera motion endpoint (~every 2 seconds)
-  if (now - lastCamPoll >= 2000 && currentPage == PAGE_DASHBOARD) {
+  // Poll camera motion endpoint (~every 5 seconds, not while streaming)
+  if (!streamConnected && now - lastCamPoll >= 5000 && currentPage == PAGE_DASHBOARD) {
     pollCameraMotion();
     lastCamPoll = now;
   }
