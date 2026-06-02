@@ -534,12 +534,16 @@ static void toggleGridCb(lv_event_t *e) {
   (void)e;
   gridMode = !gridMode;
   if (gridMode) {
-    // Show both images side-by-side, hide switch button
+    // Show both images side-by-side using LVGL zoom
     lv_label_set_text(lblGrid, LV_SYMBOL_IMAGE "  Single");
     lv_label_set_text(lblCamTitle, LV_SYMBOL_VIDEO "  Grid View");
-    if (camImg) lv_obj_set_size(camImg, 160, 120);
-    if (camImg1) { lv_obj_clear_flag(camImg1, LV_OBJ_FLAG_HIDDEN); lv_obj_set_size(camImg1, 160, 120); }
-    // Disconnect single stream and connect both
+    // Scale both images to 50% (128 = half of 256 normal scale)
+    if (camImg)  lv_image_set_scale(camImg, 128);
+    if (camImg1) {
+      lv_obj_clear_flag(camImg1, LV_OBJ_FLAG_HIDDEN);
+      lv_image_set_scale(camImg1, 128);
+    }
+    // Disconnect current single stream — main loop will connect both
     for (int i = 0; i < MAX_NODES; i++) {
       nodes[i].streamClient.stop();
       nodes[i].streamConnected = false;
@@ -551,7 +555,8 @@ static void toggleGridCb(lv_event_t *e) {
     char buf[32];
     snprintf(buf, sizeof(buf), LV_SYMBOL_VIDEO "  Cam %d", activeNodeIdx);
     lv_label_set_text(lblCamTitle, buf);
-    if (camImg) lv_obj_set_size(camImg, CAM_W, CAM_H);
+    // Restore full scale for single cam
+    if (camImg)  lv_image_set_scale(camImg, 256);
     if (camImg1) lv_obj_add_flag(camImg1, LV_OBJ_FLAG_HIDDEN);
     // Disconnect all streams, let main loop reconnect to activeNodeIdx
     for (int i = 0; i < MAX_NODES; i++) {
@@ -1314,7 +1319,7 @@ bool connectNodeStream(int idx) {
     AUTH_HEADER, hmac,
     AUTH_NONCE_HEADER, nonce);
   node.streamClient.print(req);
-  unsigned long t = millis() + 5000;
+  unsigned long t = millis() + 2000;  // 2s timeout (was 5s) — keep UI responsive
   while (millis() < t) {
     if (node.streamClient.available()) {
       if (node.streamClient.readStringUntil('\n').startsWith("--" MJPEG_BOUNDARY)) {
@@ -1340,7 +1345,9 @@ bool readNodeFrame(int idx) {
   CameraNode &node = nodes[idx];
   if (!node.streamClient.connected()) { node.streamConnected = false; return false; }
   int clen = -1;
-  unsigned long t = millis() + 3000;
+  // Use shorter timeouts in grid mode to keep both streams responsive
+  unsigned long timeout = gridMode ? 500 : 3000;
+  unsigned long t = millis() + timeout;
   while (millis() < t) {
     if (!node.streamClient.available()) { delay(1); continue; }
     String l = node.streamClient.readStringUntil('\n'); l.trim();
@@ -1348,7 +1355,7 @@ bool readNodeFrame(int idx) {
     if (l.startsWith("Content-Length:")) clen = l.substring(15).toInt();
   }
   if (clen <= 0 || clen > JPEG_BUF_SIZE) return false;
-  int rd = 0; t = millis() + 3000;
+  int rd = 0; t = millis() + timeout;
   while (rd < clen && millis() < t) {
     if (node.streamClient.available()) {
       int g = node.streamClient.read(jpegBuf + rd, min((int)node.streamClient.available(), clen - rd));
@@ -1357,7 +1364,7 @@ bool readNodeFrame(int idx) {
   }
   if (rd != clen) return false;
   jpegLen = clen;
-  t = millis() + 1000;
+  t = millis() + 500;
   while (millis() < t) {
     if (node.streamClient.available()) {
       String l = node.streamClient.readStringUntil('\n'); l.trim();
@@ -1625,22 +1632,32 @@ void loop() {
   if (currentPage == PAGE_DASHBOARD) {
 
     if (gridMode && activeNodeCount >= 2) {
-      // === GRID MODE: alternate between both nodes ===
-      static int gridRoundRobin = 0;
-      for (int pass = 0; pass < 2; pass++) {
-        int idx = (gridRoundRobin + pass) % MAX_NODES;
-        if (!nodes[idx].active) continue;
-        if (!nodes[idx].streamConnected) connectNodeStream(idx);
-        if (nodes[idx].streamConnected && readNodeFrame(idx)) {
+      // === GRID MODE: one connection attempt per loop, read from whoever has data ===
+      static int gridConnectIdx = 0;  // Which node to try connecting next
+
+      // Connect one disconnected node per iteration (avoid blocking both in same loop)
+      for (int i = 0; i < MAX_NODES; i++) {
+        int idx = (gridConnectIdx + i) % MAX_NODES;
+        if (nodes[idx].active && !nodes[idx].streamConnected) {
+          connectNodeStream(idx);
+          gridConnectIdx = (idx + 1) % MAX_NODES;
+          break;  // Only one connect attempt per loop
+        }
+      }
+
+      // Read frames from connected nodes — try both, decode whichever has data
+      for (int idx = 0; idx < MAX_NODES; idx++) {
+        if (!nodes[idx].active || !nodes[idx].streamConnected) continue;
+        // Non-blocking check: only read if data is available
+        if (!nodes[idx].streamClient.available()) continue;
+        if (readNodeFrame(idx)) {
           uint16_t *fb = (idx == 0) ? camFrameBuf : camFrameBuf1;
           lv_image_dsc_t *dsc = (idx == 0) ? &camImgDsc : &camImgDsc1;
           lv_obj_t *img = (idx == 0) ? camImg : camImg1;
           if (fb) decodeFrame(fb, dsc, img);
           frameCount++;
-          break;  // One frame per loop iteration to keep UI responsive
         }
       }
-      gridRoundRobin = (gridRoundRobin + 1) % MAX_NODES;
       streamConnected = nodes[0].streamConnected || nodes[1].streamConnected;
     } else {
       // === SINGLE MODE: stream from activeNodeIdx ===
