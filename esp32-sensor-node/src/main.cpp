@@ -11,6 +11,7 @@
 #include "esp_camera.h"
 #include "esp_sleep.h"
 #include "esp_wifi.h"
+#include "mbedtls/md.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -82,6 +83,39 @@ static SemaphoreHandle_t cameraMutex   = nullptr;  // Guards esp_camera_fb_get
 static volatile uint32_t httpTaskWdog    = 0;  // Watchdog counters
 static volatile uint32_t motionTaskWdog  = 0;
 static volatile uint32_t housekeepWdog   = 0;
+
+// ============================================================
+// HMAC-SHA256 Authentication
+// ============================================================
+// Generate HMAC-SHA256 hex string from a message
+static void hmacSha256Hex(const char *msg, char *outHex) {
+  uint8_t hash[32];
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
+  mbedtls_md_hmac_starts(&ctx, (const unsigned char *)HMAC_SECRET_KEY, strlen(HMAC_SECRET_KEY));
+  mbedtls_md_hmac_update(&ctx, (const unsigned char *)msg, strlen(msg));
+  mbedtls_md_hmac_finish(&ctx, hash);
+  mbedtls_md_free(&ctx);
+  for (int i = 0; i < 32; i++) {
+    sprintf(outHex + i * 2, "%02x", hash[i]);
+  }
+  outHex[64] = '\0';
+}
+
+// Verify HMAC token from request header
+static bool verifyHmacAuth(const char *path) {
+  if (!server.hasHeader(AUTH_HEADER) || !server.hasHeader(AUTH_NONCE_HEADER)) {
+    return false;
+  }
+  String token = server.header(AUTH_HEADER);
+  String nonce = server.header(AUTH_NONCE_HEADER);
+  // Reconstruct expected HMAC: HMAC(key, "nonce:path")
+  String msg = nonce + ":" + String(path);
+  char expected[65];
+  hmacSha256Hex(msg.c_str(), expected);
+  return token.equals(expected);
+}
 
 // ============================================================
 // Camera Init
@@ -325,6 +359,11 @@ void handleMotion() {
 }
 
 void handleMotionConfig() {
+  // Verify HMAC auth for config changes
+  if (!verifyHmacAuth(MOTION_PATH)) {
+    server.send(403, "application/json", "{\"error\":\"HMAC auth failed\"}");
+    return;
+  }
   if (server.hasArg("pixel_threshold")) {
     pixelThreshold = constrain(server.arg("pixel_threshold").toInt(), 1, 100);
   }
@@ -405,6 +444,11 @@ void handleOtaUpload() {
 }
 
 void handleOtaUploadDone() {
+  // Verify HMAC auth for OTA (critical endpoint)
+  if (!verifyHmacAuth(OTA_UPLOAD_PATH)) {
+    server.send(403, "application/json", "{\"error\":\"HMAC auth failed\"}");
+    return;
+  }
   if (otaError.length() > 0) {
     char json[128];
     snprintf(json, sizeof(json), "{\"success\":false,\"error\":\"%s\"}", otaError.c_str());
@@ -606,6 +650,9 @@ void setup() {
   server.on(NODE_INFO_PATH, HTTP_GET, handleNodeInfo);
   server.on(OTA_STATUS_PATH, HTTP_GET, handleOtaStatus);
   server.on(OTA_UPLOAD_PATH, HTTP_POST, handleOtaUploadDone, handleOtaUpload);
+  // Collect auth headers for HMAC verification
+  const char *authHeaders[] = {AUTH_HEADER, AUTH_NONCE_HEADER};
+  server.collectHeaders(authHeaders, 2);
   server.begin();
   Serial.println("HTTP server started");
 

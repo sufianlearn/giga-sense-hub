@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstring>
 #include "FlashIAP.h"
+#include "mbedtls/sha256.h"
 
 // ---- Flash geometry -------------------------------------------------------
 #define STORAGE_FLASH_ADDR   0x081E0000UL   // Bank 2, sector 7
@@ -36,7 +37,7 @@
 
 // ---- Magic & version ------------------------------------------------------
 #define SETTINGS_MAGIC       0x47494741UL   // "GIGA" in ASCII (little-endian)
-#define SETTINGS_VERSION     1U
+#define SETTINGS_VERSION     2U
 
 // ---------------------------------------------------------------------------
 //  Settings struct – stored verbatim in flash
@@ -44,7 +45,8 @@
 struct PersistentSettings {
     uint32_t magic;              // Must equal SETTINGS_MAGIC
     uint32_t version;            // Struct version for future migration
-    char     pin[5];             // 4-digit PIN + null terminator
+    char     pin[5];             // 4-digit PIN + null terminator (DEPRECATED — kept for migration)
+    uint8_t  pinHash[32];        // SHA-256 hash of the PIN (replaces plaintext)
     int      autoLockSecs;       // Auto-lock timeout in seconds
     int      motionThreshold;    // Motion detection sensitivity (0-100)
     int      targetFps;          // Camera target frame rate
@@ -88,13 +90,31 @@ static PersistentSettings currentSettings;
 //  Public API
 // ---------------------------------------------------------------------------
 
+// Compute SHA-256 hash of a null-terminated PIN string
+inline void hashPin(const char *pin, uint8_t outHash[32]) {
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, 0);  // 0 = SHA-256 (not SHA-224)
+    mbedtls_sha256_update(&ctx, reinterpret_cast<const unsigned char *>(pin), strlen(pin));
+    mbedtls_sha256_finish(&ctx, outHash);
+    mbedtls_sha256_free(&ctx);
+}
+
+// Compare a plaintext PIN against a stored hash
+inline bool verifyPin(const char *pin, const uint8_t storedHash[32]) {
+    uint8_t inputHash[32];
+    hashPin(pin, inputHash);
+    return memcmp(inputHash, storedHash, 32) == 0;
+}
+
 // Fill a struct with safe compile-time defaults.
 inline void storageDefaults(PersistentSettings &s) {
     memset(&s, 0, sizeof(s));
     s.magic           = SETTINGS_MAGIC;
     s.version         = SETTINGS_VERSION;
-    strncpy(s.pin, "1234", sizeof(s.pin));
-    s.pin[4]          = '\0';
+    strncpy(s.pin, "", sizeof(s.pin));  // Clear plaintext (deprecated)
+    s.pin[0]          = '\0';
+    hashPin("1234", s.pinHash);         // Default PIN hashed
     s.autoLockSecs    = 120;
     s.motionThreshold = 50;
     s.targetFps       = 15;

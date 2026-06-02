@@ -67,4 +67,12 @@
 #define POWER_STATE_LIGHT     1
 #define POWER_STATE_DEEP      2
 
+// --- Security ---
+// HMAC-SHA256 shared secret for node authentication
+// Both GIGA and ESP32 nodes use this to sign/verify HTTP requests
+// In production, this should be per-device and provisioned during setup
+#define HMAC_SECRET_KEY    "gsh_k3y_2026!s3cure"
+#define AUTH_HEADER        "X-GSH-Auth"    // HTTP header for HMAC token
+#define AUTH_NONCE_HEADER  "X-GSH-Nonce"   // Replay protection
+
 #endif // GIGA_SENSE_PROTOCOL_H
