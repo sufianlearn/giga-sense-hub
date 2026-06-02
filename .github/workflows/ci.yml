@@ -1,0 +1,94 @@
+name: PlatformIO CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'esp32-sensor-node/**'
+      - 'giga-display-hub/**'
+      - 'shared/**'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'esp32-sensor-node/**'
+      - 'giga-display-hub/**'
+      - 'shared/**'
+      - '.github/workflows/**'
+
+jobs:
+  build-esp32:
+    name: Build ESP32 Camera Nodes
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [seeed_xiao_esp32s3, node1]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build ${{ matrix.env }}
+        run: pio run -e ${{ matrix.env }}
+        working-directory: esp32-sensor-node
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-${{ matrix.env }}-firmware
+          path: esp32-sensor-node/.pio/build/${{ matrix.env }}/firmware.bin
+          retention-days: 30
+
+  build-giga:
+    name: Build GIGA Display Hub
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build GIGA R1
+        run: pio run
+        working-directory: giga-display-hub
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: giga-display-hub-firmware
+          path: giga-display-hub/.pio/build/giga_r1_wifi/firmware.bin
+          retention-days: 30
+
+  build-report:
+    name: Build Size Report
+    runs-on: ubuntu-latest
+    needs: [build-esp32, build-giga]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: ESP32 Node 0 size
+        run: pio run -e seeed_xiao_esp32s3 -t size
+        working-directory: esp32-sensor-node
+
+      - name: GIGA R1 size
+        run: pio run -t size
+        working-directory: giga-display-hub
