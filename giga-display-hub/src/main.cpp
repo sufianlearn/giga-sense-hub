@@ -12,6 +12,7 @@
 #include "protocol.h"
 #include "tjpgd.h"
 #include "storage.h"
+#include "eventlog.h"
 
 Arduino_H7_Video display(800, 480, GigaDisplayShield);
 Arduino_GigaDisplayTouch touchCtrl;
@@ -36,7 +37,7 @@ BoschSensorClass myIMU(Wire1);
 // ============================================================
 // App State
 // ============================================================
-enum AppPage { PAGE_LOGIN, PAGE_DASHBOARD, PAGE_SETTINGS };
+enum AppPage { PAGE_LOGIN, PAGE_DASHBOARD, PAGE_SETTINGS, PAGE_LOG };
 AppPage currentPage = PAGE_LOGIN;
 
 // Settings are now persistent via storage.h (FlashIAP).
@@ -83,6 +84,7 @@ static lv_image_dsc_t camImgDsc;
 static lv_obj_t *scrLogin = nullptr;
 static lv_obj_t *scrDashboard = nullptr;
 static lv_obj_t *scrSettings = nullptr;
+static lv_obj_t *scrLog = nullptr;
 
 // Login page
 static lv_obj_t *pinDots[4];
@@ -111,6 +113,10 @@ static lv_obj_t *lblSysUptime, *lblSysMem, *lblSysFw;
 
 // PIN change in settings
 static lv_obj_t *taNewPin;
+
+// Activity Log page
+static lv_obj_t *logList = nullptr;
+static lv_obj_t *lblLogCount;
 
 // ============================================================
 // JPEG Decoder
@@ -219,10 +225,12 @@ static void pinAppend(char c) {
       lastActivity = millis();
       currentPage = PAGE_DASHBOARD;
       lv_screen_load_anim(scrDashboard, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+      eventInfo("User logged in");
       Serial.println("Login OK -> Dashboard");
     } else {
       lv_label_set_text(lblLoginError, "Wrong PIN");
       lv_obj_set_style_text_color(lblLoginError, C_RED, 0);
+      eventAlert("Failed login attempt");
       for (int i = 0; i < 4; i++)
         lv_obj_set_style_bg_color(pinDots[i], C_RED, 0);
 
@@ -359,6 +367,8 @@ static void lockCb(lv_event_t *e) {
       settings.doorLocked[i] = on;
       lv_led_set_color(ledDoor[i], on ? C_GREEN : C_RED);
       lv_led_set_brightness(ledDoor[i], on ? 200 : 255);
+      { char lb[48]; snprintf(lb, sizeof(lb), "%s %s", doorNames[i], on ? "LOCKED" : "UNLOCKED");
+        eventInfo(lb); }
       // Persist door lock state
       settings.crc32 = _storage_detail::settingsCrc(settings);
       storageSave(settings);
@@ -373,11 +383,22 @@ static void gotoSettingsCb(lv_event_t *e) {
   Serial.println("Dashboard -> Settings");
 }
 
+static void refreshLogList();  // forward declaration
+
+static void gotoLogCb(lv_event_t *e) {
+  touchActivity();
+  currentPage = PAGE_LOG;
+  refreshLogList();
+  lv_screen_load_anim(scrLog, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+  Serial.println("Dashboard -> Activity Log");
+}
+
 static void logoutCb(lv_event_t *e) {
   touchActivity();
   currentPage = PAGE_LOGIN;
   pinClear();
   lv_screen_load_anim(scrLogin, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
+  eventInfo("User logged out");
   Serial.println("Dashboard -> Login (logout)");
 }
 
@@ -469,6 +490,22 @@ void buildDashboardPage() {
   lv_obj_set_style_text_color(sIcon, C_TEXT_DIM, 0);
   lv_obj_center(sIcon);
   lv_obj_add_event_cb(btnSettings, gotoSettingsCb, LV_EVENT_CLICKED, nullptr);
+
+  // Log button (large touch target)
+  lv_obj_t *btnLog = lv_obj_create(navRow);
+  lv_obj_set_size(btnLog, 60, 30);
+  lv_obj_set_style_bg_color(btnLog, C_PIN_BTN, 0);
+  lv_obj_set_style_bg_color(btnLog, C_PIN_BTN_PR, LV_STATE_PRESSED);
+  lv_obj_set_style_bg_opa(btnLog, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(btnLog, 6, 0);
+  lv_obj_set_style_border_width(btnLog, 0, 0);
+  lv_obj_clear_flag(btnLog, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(btnLog, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_t *logIcon = lv_label_create(btnLog);
+  lv_label_set_text(logIcon, LV_SYMBOL_LIST);
+  lv_obj_set_style_text_color(logIcon, C_TEXT_DIM, 0);
+  lv_obj_center(logIcon);
+  lv_obj_add_event_cb(btnLog, gotoLogCb, LV_EVENT_CLICKED, nullptr);
 
   // Lock/logout button (large touch target)
   lv_obj_t *btnLock = lv_obj_create(navRow);
@@ -627,6 +664,7 @@ static void pinChangeCb(lv_event_t *e) {
     settings.crc32 = _storage_detail::settingsCrc(settings);
     storageSave(settings);
     lv_textarea_set_text(taNewPin, "");
+    eventInfo("PIN changed successfully");
     Serial.print("PIN changed and saved to flash");
   }
 }
@@ -828,6 +866,139 @@ void buildSettingsPage() {
 }
 
 // ============================================================
+// PAGE 4: ACTIVITY LOG
+// ============================================================
+
+static void backFromLogCb(lv_event_t *e) {
+  touchActivity();
+  currentPage = PAGE_DASHBOARD;
+  lv_screen_load_anim(scrDashboard, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
+}
+
+static void refreshLogList() {
+  if (!logList) return;
+  // Clear existing children
+  lv_obj_clean(logList);
+
+  int n = eventLogCount();
+  char timeBuf[16];
+
+  for (int i = 0; i < n; i++) {
+    const EventEntry *ev = eventLogGetNewest(i);
+    if (!ev) continue;
+
+    eventFormatTime(ev->timestamp, timeBuf, sizeof(timeBuf));
+
+    // Row container
+    lv_obj_t *row = lv_obj_create(logList);
+    lv_obj_set_size(row, lv_pct(100), 32);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 2, 0);
+    lv_obj_set_style_pad_column(row, 8, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Severity icon
+    lv_obj_t *icon = lv_label_create(row);
+    lv_label_set_text(icon, eventSeverityIcon(ev->severity));
+    lv_color_t ic;
+    switch (ev->severity) {
+      case EVT_INFO:  ic = C_GREEN;  break;
+      case EVT_WARN:  ic = C_ORANGE; break;
+      case EVT_ALERT: ic = C_RED;    break;
+      default:        ic = C_TEXT;    break;
+    }
+    lv_obj_set_style_text_color(icon, ic, 0);
+    lv_obj_set_size(icon, 20, LV_SIZE_CONTENT);
+
+    // Timestamp
+    lv_obj_t *ts = lv_label_create(row);
+    lv_label_set_text(ts, timeBuf);
+    lv_obj_set_style_text_color(ts, C_TEXT_DIM, 0);
+    lv_obj_set_size(ts, 80, LV_SIZE_CONTENT);
+
+    // Message
+    lv_obj_t *msg = lv_label_create(row);
+    lv_label_set_text(msg, ev->message);
+    lv_obj_set_style_text_color(msg, C_TEXT, 0);
+    lv_obj_set_flex_grow(msg, 1);
+
+    // Separator line
+    if (i < n - 1) {
+      lv_obj_t *sep = lv_obj_create(logList);
+      lv_obj_set_size(sep, lv_pct(100), 1);
+      lv_obj_set_style_bg_color(sep, C_BORDER, 0);
+      lv_obj_set_style_bg_opa(sep, LV_OPA_COVER, 0);
+      lv_obj_set_style_border_width(sep, 0, 0);
+      lv_obj_clear_flag(sep, LV_OBJ_FLAG_SCROLLABLE);
+    }
+  }
+
+  // Update count label
+  if (lblLogCount) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d events", n);
+    lv_label_set_text(lblLogCount, buf);
+  }
+}
+
+void buildLogPage() {
+  scrLog = lv_obj_create(nullptr);
+  lv_obj_set_style_bg_color(scrLog, C_BG, 0);
+
+  // Top bar
+  lv_obj_t *top = lv_obj_create(scrLog);
+  lv_obj_set_size(top, 800, 34);
+  lv_obj_set_pos(top, 0, 0);
+  lv_obj_set_style_bg_color(top, C_CARD, 0);
+  lv_obj_set_style_bg_opa(top, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(top, 0, 0);
+  lv_obj_set_style_radius(top, 0, 0);
+  lv_obj_set_style_pad_hor(top, 12, 0);
+  lv_obj_clear_flag(top, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(top, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(top, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(top, 10, 0);
+
+  // Back button
+  lv_obj_t *btnBack = lv_obj_create(top);
+  lv_obj_set_size(btnBack, 60, 30);
+  lv_obj_set_style_bg_color(btnBack, C_PIN_BTN, 0);
+  lv_obj_set_style_bg_opa(btnBack, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(btnBack, 4, 0);
+  lv_obj_set_style_border_width(btnBack, 0, 0);
+  lv_obj_clear_flag(btnBack, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(btnBack, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_t *bIcon = lv_label_create(btnBack);
+  lv_label_set_text(bIcon, LV_SYMBOL_LEFT);
+  lv_obj_set_style_text_color(bIcon, C_TEXT, 0);
+  lv_obj_center(bIcon);
+  lv_obj_add_event_cb(btnBack, backFromLogCb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *titleLbl = lv_label_create(top);
+  lv_label_set_text(titleLbl, LV_SYMBOL_LIST "  Activity Log");
+  lv_obj_set_style_text_color(titleLbl, C_TEXT, 0);
+
+  lblLogCount = lv_label_create(top);
+  lv_label_set_text(lblLogCount, "0 events");
+  lv_obj_set_style_text_color(lblLogCount, C_TEXT_DIM, 0);
+  lv_obj_set_flex_grow(lblLogCount, 1);
+  lv_obj_set_style_text_align(lblLogCount, LV_TEXT_ALIGN_RIGHT, 0);
+
+  // Scrollable log list
+  lv_obj_t *card = mkCard(scrLog, 788, 430);
+  lv_obj_set_pos(card, 6, 40);
+  lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_gap(card, 2, 0);
+  lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scroll_dir(card, LV_DIR_VER);
+
+  logList = card;
+}
+
+// ============================================================
 // WiFi & Stream
 // ============================================================
 
@@ -919,6 +1090,8 @@ void updateDashboardUI() {
   const char *motion; lv_color_t mc;
   if (totalGyro > 100 * motThresh || totalAccel > 2.0f * motThresh) {
     motion = "Motion: ALERT!"; mc = C_RED;
+    static unsigned long lastMotionAlert = 0;
+    if (millis() - lastMotionAlert > 5000) { eventAlert("Motion detected — ALERT!"); lastMotionAlert = millis(); }
   } else if (totalGyro > 30 * motThresh || totalAccel > 1.3f * motThresh) {
     motion = "Motion: Vibration"; mc = C_ORANGE;
   } else {
@@ -1002,6 +1175,7 @@ void setup() {
   buildLoginPage();
   buildDashboardPage();
   buildSettingsPage();
+  buildLogPage();
 
   // Start on login
   lv_screen_load(scrLogin);
@@ -1010,6 +1184,7 @@ void setup() {
   // Connect WiFi in background — don't block the login screen
   lastActivity = millis();
   lastFpsCalc = millis();
+  eventInfo("System booted");
   Serial.println("App ready — WiFi connects on dashboard entry");
 }
 
@@ -1030,10 +1205,12 @@ void loop() {
         if (!wifiStarted) { WiFi.begin(AP_SSID, AP_PASSWORD); wifiStarted = true; }
         if (WiFi.status() == WL_CONNECTED) {
           wifiConnected = true; wifiStarted = false;
+          eventInfo("WiFi connected to camera AP");
           Serial.print("WiFi OK: "); Serial.println(WiFi.localIP());
         }
       } else {
         wifiConnected = false; streamConnected = false;
+        eventWarn("WiFi connection lost");
         WiFi.begin(AP_SSID, AP_PASSWORD);
       }
     } else {
@@ -1083,6 +1260,7 @@ void loop() {
       currentPage = PAGE_LOGIN;
       pinClear();
       lv_screen_load_anim(scrLogin, LV_SCR_LOAD_ANIM_FADE_ON, 500, 0, false);
+      eventWarn("Auto-lock triggered (inactivity)");
       Serial.println("Auto-lock -> Login");
     }
   }
