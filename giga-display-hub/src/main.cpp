@@ -4,6 +4,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <math.h>
 #include <Arduino_H7_Video.h>
 #include <Arduino_GigaDisplayTouch.h>
 #include <Arduino_BMI270_BMM150.h>
@@ -81,6 +82,7 @@ float currentFps = 0;
 // IMU
 float accelX = 0, accelY = 0, accelZ = 0;
 float gyroX = 0, gyroY = 0, gyroZ = 0;
+float magX = 0, magY = 0, magZ = 0;  // BMM150 magnetometer (µT)
 bool imuReady = false;
 bool imuOnWire1 = false;
 
@@ -133,7 +135,7 @@ static lv_obj_t *swDoor[3];
 static lv_obj_t *ledDoor[3];
 static lv_obj_t *ledWin[3];
 static lv_obj_t *lblWin[3];
-static lv_obj_t *lblAccel, *lblGyro, *lblMotion, *lblUptime;
+static lv_obj_t *lblAccel, *lblGyro, *lblMag, *lblMotion, *lblUptime;
 static lv_obj_t *lblCamMotion;  // Camera-based motion from ESP32
 static lv_obj_t *lblCamTitle;   // Camera card title (shows active cam)
 static lv_obj_t *lblStatusBar;
@@ -744,7 +746,7 @@ void buildDashboardPage() {
   lv_obj_set_style_text_color(lblStreamStatus, C_TEXT_DIM, 0);
 
   // IMU card
-  lv_obj_t *sc = mkCard(scrDashboard, 370, 128);
+  lv_obj_t *sc = mkCard(scrDashboard, 370, 148);
   lv_obj_set_pos(sc, 6, 350);
   lv_obj_set_flex_flow(sc, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_gap(sc, 3, 0);
@@ -754,6 +756,8 @@ void buildDashboardPage() {
   lv_obj_set_style_text_color(lblAccel, C_TEXT_DIM, 0);
   lblGyro   = lv_label_create(sc); lv_label_set_text(lblGyro, "Gyro: --");
   lv_obj_set_style_text_color(lblGyro, C_TEXT_DIM, 0);
+  lblMag    = lv_label_create(sc); lv_label_set_text(lblMag, "Mag: --");
+  lv_obj_set_style_text_color(lblMag, C_TEXT_DIM, 0);
   lblMotion = lv_label_create(sc); lv_label_set_text(lblMotion, "Motion: --");
   lv_obj_set_style_text_color(lblMotion, C_GREEN, 0);
   lblCamMotion = lv_label_create(sc); lv_label_set_text(lblCamMotion, "Camera: --");
@@ -1400,6 +1404,20 @@ void updateDashboardUI() {
   snprintf(buf, sizeof(buf), "Gyro:  X:%.1f  Y:%.1f  Z:%.1f dps", gyroX, gyroY, gyroZ);
   lv_label_set_text(lblGyro, buf);
 
+  // Magnetometer with compass heading
+  float heading = atan2(magY, magX) * 180.0f / 3.14159f;
+  if (heading < 0) heading += 360.0f;
+  const char *dir = "N";
+  if (heading >= 22.5f && heading < 67.5f)   dir = "NE";
+  else if (heading >= 67.5f && heading < 112.5f)  dir = "E";
+  else if (heading >= 112.5f && heading < 157.5f) dir = "SE";
+  else if (heading >= 157.5f && heading < 202.5f) dir = "S";
+  else if (heading >= 202.5f && heading < 247.5f) dir = "SW";
+  else if (heading >= 247.5f && heading < 292.5f) dir = "W";
+  else if (heading >= 292.5f && heading < 337.5f) dir = "NW";
+  snprintf(buf, sizeof(buf), "Mag: %.0f\xC2\xB0 %s  (%.0f %.0f %.0f \xC2\xB5T)", heading, dir, magX, magY, magZ);
+  lv_label_set_text(lblMag, buf);
+
   float totalAccel = abs(accelX) + abs(accelY) + abs(accelZ);
   float totalGyro = abs(gyroX) + abs(gyroY) + abs(gyroZ);
   float motThresh = settings.motionThreshold / 50.0f;
@@ -1666,6 +1684,7 @@ void loop() {
     BoschSensorClass &imu = imuOnWire1 ? myIMU : IMU;
     if (imu.accelerationAvailable()) imu.readAcceleration(accelX, accelY, accelZ);
     if (imu.gyroscopeAvailable()) imu.readGyroscope(gyroX, gyroY, gyroZ);
+    if (imu.magneticFieldAvailable()) imu.readMagneticField(magX, magY, magZ);
     lastIMU = now;
   }
 
