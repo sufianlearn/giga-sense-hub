@@ -9,6 +9,8 @@
 #include <ArduinoOTA.h>
 #include <Update.h>
 #include "esp_camera.h"
+#include "esp_sleep.h"
+#include "esp_wifi.h"
 #include "protocol.h"
 
 #ifndef NODE_ID
@@ -57,6 +59,15 @@ static bool     otaInProgress = false;
 static int      otaProgress   = 0;
 static String   otaError      = "";
 static uint32_t otaLastUpdate = 0;
+
+// ============================================================
+// Power Management State
+// ============================================================
+static int      powerState       = POWER_STATE_ACTIVE;
+static unsigned long lastActivityTime = 0;  // Last motion or stream client activity
+static bool     streamClientActive = false; // True while a client is streaming
+static int      wakeReason       = 0;       // esp_sleep_get_wakeup_cause() at boot
+static RTC_DATA_ATTR int bootCount = 0;     // Persists across deep sleep
 
 // ============================================================
 // Camera Init
@@ -231,6 +242,8 @@ void setupOTA() {
 
 void handleStream() {
   WiFiClient client = server.client();
+  streamClientActive = true;
+  lastActivityTime = millis();  // Reset idle timer
 
   String header = "HTTP/1.1 200 OK\r\n"
                   "Content-Type: multipart/x-mixed-replace;boundary=" MJPEG_BOUNDARY "\r\n"
@@ -266,6 +279,8 @@ void handleStream() {
       delay(frameInterval - elapsed);
     }
   }
+  // Stream client disconnected
+  streamClientActive = false;
 }
 
 void handleMotion() {
@@ -403,7 +418,11 @@ void handleRoot() {
 }
 
 void handleNodeInfo() {
-  char json[256];
+  // Any /info request counts as activity (GIGA is scanning us)
+  lastActivityTime = millis();
+  char json[384];
+  const char *pwrStr = powerState == POWER_STATE_LIGHT ? "light" :
+                       powerState == POWER_STATE_DEEP  ? "deep" : "active";
   snprintf(json, sizeof(json),
     "{\"nodeId\":%d,"
     "\"firmware\":\"%s\","
@@ -412,7 +431,11 @@ void handleNodeInfo() {
     "\"rssi\":%d,"
     "\"freeHeap\":%lu,"
     "\"uptime\":%lu,"
-    "\"motionEnabled\":%s}",
+    "\"motionEnabled\":%s,"
+    "\"motionCount\":%lu,"
+    "\"powerState\":\"%s\","
+    "\"cpuMhz\":%d,"
+    "\"bootCount\":%d}",
     NODE_ID,
     FW_VERSION,
     WiFi.localIP().toString().c_str(),
@@ -420,7 +443,11 @@ void handleNodeInfo() {
     WiFi.RSSI(),
     (unsigned long)ESP.getFreeHeap(),
     millis() / 1000,
-    motionEnabled ? "true" : "false");
+    motionEnabled ? "true" : "false",
+    (unsigned long)motionCount,
+    pwrStr,
+    getCpuFrequencyMhz(),
+    bootCount);
   server.send(200, "application/json", json);
 }
 
@@ -477,6 +504,13 @@ void setup() {
   server.on(OTA_UPLOAD_PATH, HTTP_POST, handleOtaUploadDone, handleOtaUpload);
   server.begin();
   Serial.println("HTTP server started");
+
+  // Power management init
+  bootCount++;
+  wakeReason = esp_sleep_get_wakeup_cause();
+  lastActivityTime = millis();
+  powerState = POWER_STATE_ACTIVE;
+  Serial.printf("Boot #%d | Wake reason: %d\n", bootCount, wakeReason);
 }
 
 static unsigned long lastDetect = 0;
@@ -497,5 +531,42 @@ void loop() {
   if (millis() - lastDetect >= 250) {
     lastDetect = millis();
     runMotionDetection();
+    // Motion resets idle timer
+    if (motionDetected) {
+      lastActivityTime = millis();
+      powerState = POWER_STATE_ACTIVE;
+    }
+  }
+
+  // Power management state machine
+  unsigned long idle = millis() - lastActivityTime;
+
+  if (powerState == POWER_STATE_ACTIVE) {
+    if (!streamClientActive && idle >= IDLE_DEEP_SLEEP_MS && !otaInProgress) {
+      // No stream, no motion for 5 min → deep sleep
+      Serial.printf("Deep sleep: idle %lums, wake in %ds\n", idle, DEEP_SLEEP_WAKE_US / 1000000);
+      Serial.flush();
+      esp_sleep_enable_timer_wakeup(DEEP_SLEEP_WAKE_US);
+      esp_deep_sleep_start();
+      // Never reaches here — deep sleep resets the CPU
+    }
+    else if (!streamClientActive && idle >= IDLE_LIGHT_SLEEP_MS && !otaInProgress) {
+      // No stream, no motion for 60s → light sleep (WiFi stays)
+      if (powerState != POWER_STATE_LIGHT) {
+        Serial.printf("Light sleep mode: idle %lums\n", idle);
+        powerState = POWER_STATE_LIGHT;
+        // Reduce CPU frequency to save power
+        setCpuFrequencyMhz(80);  // Down from 240MHz
+      }
+    }
+  }
+  else if (powerState == POWER_STATE_LIGHT) {
+    // Wake from light sleep on activity
+    if (motionDetected || streamClientActive) {
+      Serial.println("Waking from light sleep — activity detected");
+      powerState = POWER_STATE_ACTIVE;
+      setCpuFrequencyMhz(240);  // Restore full speed
+      lastActivityTime = millis();
+    }
   }
 }
