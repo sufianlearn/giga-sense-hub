@@ -11,6 +11,7 @@
 #include "SDRAM.h"
 #include "protocol.h"
 #include "tjpgd.h"
+#include "storage.h"
 
 Arduino_H7_Video display(800, 480, GigaDisplayShield);
 Arduino_GigaDisplayTouch touchCtrl;
@@ -38,14 +39,9 @@ BoschSensorClass myIMU(Wire1);
 enum AppPage { PAGE_LOGIN, PAGE_DASHBOARD, PAGE_SETTINGS };
 AppPage currentPage = PAGE_LOGIN;
 
-struct AppSettings {
-  char pin[5] = "1234";
-  int autoLockSecs = 120;
-  int motionThreshold = 50;   // percentage 0-100
-  int targetFps = 15;
-  int jpegQuality = 12;
-};
-AppSettings settings;
+// Settings are now persistent via storage.h (FlashIAP).
+// storageSettings() returns a reference to the RAM-cached PersistentSettings.
+#define settings storageSettings()
 
 // WiFi / Stream
 WiFiClient streamClient;
@@ -61,8 +57,8 @@ float gyroX = 0, gyroY = 0, gyroZ = 0;
 bool imuReady = false;
 bool imuOnWire1 = false;
 
-// Door / Window state
-bool doorLocked[3] = {true, true, true};
+// Door / Window state (doors now persisted via storage.h)
+// doorLocked[] is accessed via settings.doorLocked[]
 const char *doorNames[3] = {"Front Door", "Back Door", "Garage"};
 bool windowOpen[3] = {false, false, false};
 const char *windowNames[3] = {"Living Room", "Bedroom", "Kitchen"};
@@ -360,9 +356,12 @@ static void lockCb(lv_event_t *e) {
   bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
   for (int i = 0; i < 3; i++) {
     if (sw == swDoor[i]) {
-      doorLocked[i] = on;
+      settings.doorLocked[i] = on;
       lv_led_set_color(ledDoor[i], on ? C_GREEN : C_RED);
       lv_led_set_brightness(ledDoor[i], on ? 200 : 255);
+      // Persist door lock state
+      settings.crc32 = _storage_detail::settingsCrc(settings);
+      storageSave(settings);
     }
   }
 }
@@ -385,8 +384,8 @@ static void logoutCb(lv_event_t *e) {
 static void mkDoorRow(lv_obj_t *p, int idx) {
   lv_obj_t *row = mkRow(p, 34);
   ledDoor[idx] = lv_led_create(row);
-  lv_led_set_color(ledDoor[idx], doorLocked[idx] ? C_GREEN : C_RED);
-  lv_led_set_brightness(ledDoor[idx], doorLocked[idx] ? 200 : 255);
+  lv_led_set_color(ledDoor[idx], settings.doorLocked[idx] ? C_GREEN : C_RED);
+  lv_led_set_brightness(ledDoor[idx], settings.doorLocked[idx] ? 200 : 255);
   lv_obj_set_size(ledDoor[idx], 12, 12);
 
   lv_obj_t *lbl = lv_label_create(row);
@@ -395,7 +394,7 @@ static void mkDoorRow(lv_obj_t *p, int idx) {
   lv_obj_set_flex_grow(lbl, 1);
 
   swDoor[idx] = lv_switch_create(row);
-  if (doorLocked[idx]) lv_obj_add_state(swDoor[idx], LV_STATE_CHECKED);
+  if (settings.doorLocked[idx]) lv_obj_add_state(swDoor[idx], LV_STATE_CHECKED);
   lv_obj_set_style_bg_color(swDoor[idx], C_RED, 0);
   lv_obj_set_style_bg_color(swDoor[idx], C_GREEN, LV_PART_INDICATOR | LV_STATE_CHECKED);
   lv_obj_add_event_cb(swDoor[idx], lockCb, LV_EVENT_VALUE_CHANGED, nullptr);
@@ -588,6 +587,8 @@ static void motionSliderCb(lv_event_t *e) {
   settings.motionThreshold = lv_slider_get_value((lv_obj_t *)lv_event_get_target(e));
   char buf[16]; snprintf(buf, sizeof(buf), "%d%%", settings.motionThreshold);
   lv_label_set_text(lblMotionVal, buf);
+  settings.crc32 = _storage_detail::settingsCrc(settings);
+  storageSave(settings);
 }
 
 static void autoLockSliderCb(lv_event_t *e) {
@@ -595,6 +596,8 @@ static void autoLockSliderCb(lv_event_t *e) {
   settings.autoLockSecs = lv_slider_get_value((lv_obj_t *)lv_event_get_target(e));
   char buf[16]; snprintf(buf, sizeof(buf), "%ds", settings.autoLockSecs);
   lv_label_set_text(lblAutoLockVal, buf);
+  settings.crc32 = _storage_detail::settingsCrc(settings);
+  storageSave(settings);
 }
 
 static void fpsSliderCb(lv_event_t *e) {
@@ -602,6 +605,8 @@ static void fpsSliderCb(lv_event_t *e) {
   settings.targetFps = lv_slider_get_value((lv_obj_t *)lv_event_get_target(e));
   char buf[16]; snprintf(buf, sizeof(buf), "%d fps", settings.targetFps);
   lv_label_set_text(lblFpsVal, buf);
+  settings.crc32 = _storage_detail::settingsCrc(settings);
+  storageSave(settings);
 }
 
 static void qualitySliderCb(lv_event_t *e) {
@@ -609,6 +614,8 @@ static void qualitySliderCb(lv_event_t *e) {
   settings.jpegQuality = lv_slider_get_value((lv_obj_t *)lv_event_get_target(e));
   char buf[16]; snprintf(buf, sizeof(buf), "%d", settings.jpegQuality);
   lv_label_set_text(lblQualityVal, buf);
+  settings.crc32 = _storage_detail::settingsCrc(settings);
+  storageSave(settings);
 }
 
 static void pinChangeCb(lv_event_t *e) {
@@ -617,8 +624,10 @@ static void pinChangeCb(lv_event_t *e) {
   if (strlen(newPin) == 4) {
     strncpy(settings.pin, newPin, 4);
     settings.pin[4] = '\0';
+    settings.crc32 = _storage_detail::settingsCrc(settings);
+    storageSave(settings);
     lv_textarea_set_text(taNewPin, "");
-    Serial.print("PIN changed to: "); Serial.println(settings.pin);
+    Serial.print("PIN changed and saved to flash");
   }
 }
 
@@ -966,6 +975,12 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n=== GigaSenseHub Security App ===");
+
+  // Load persistent settings from flash (or defaults on first boot)
+  storageInit();
+  Serial.print("Settings loaded — PIN: "); Serial.print(settings.pin);
+  Serial.print(", AutoLock: "); Serial.print(settings.autoLockSecs);
+  Serial.println("s");
 
   display.begin();
   Serial.println("Display OK");
