@@ -26,6 +26,13 @@
 #define MOTION_THRESHOLD_DEFAULT 15  // Per-pixel diff threshold
 #define MOTION_PERCENT_DEFAULT   5   // % of pixels that must change
 
+// --- OTA Configuration ---
+#define OTA_HOSTNAME       "gigasense-cam"
+#define OTA_PORT           3232
+#define OTA_STATUS_PATH    "/ota/status"
+#define OTA_UPLOAD_PATH    "/ota/upload"
+#define FW_VERSION         "1.1.0"
+
 // --- MJPEG Boundary ---
 #define MJPEG_BOUNDARY "frame"
 

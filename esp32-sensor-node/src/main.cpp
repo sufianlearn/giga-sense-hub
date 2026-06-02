@@ -1,11 +1,14 @@
-// ESP32-S3 Sense — Wireless Camera Node with Motion Detection
+// ESP32-S3 Sense — Wireless Camera Node with Motion Detection + OTA
 // Runs as WiFi AP, serves MJPEG video stream.
 // Frame-differencing motion detection with configurable thresholds.
+// OTA firmware updates via ArduinoOTA (accessible over AP network).
 // Board: Seeed Studio XIAO ESP32-S3 Sense
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ArduinoOTA.h>
+#include <Update.h>
 #include "esp_camera.h"
 #include "protocol.h"
 
@@ -32,17 +35,25 @@ WebServer server(STREAM_PORT);
 // ============================================================
 // Motion Detection State
 // ============================================================
-static uint8_t *refFrame = nullptr;        // Reference frame (grayscale)
-static uint8_t *curFrame = nullptr;        // Current frame (grayscale)
+static uint8_t *refFrame = nullptr;
+static uint8_t *curFrame = nullptr;
 static bool     motionDetected = false;
-static float    motionScore    = 0.0f;     // % of changed pixels
-static uint32_t motionCount    = 0;        // Cumulative motion events
+static float    motionScore    = 0.0f;
+static uint32_t motionCount    = 0;
 static unsigned long lastMotionTime = 0;
 static unsigned long lastDetectTime = 0;
 static int      pixelThreshold = MOTION_THRESHOLD_DEFAULT;
 static int      percentThreshold = MOTION_PERCENT_DEFAULT;
 static bool     motionEnabled  = true;
 static const int DETECT_PIXELS = MOTION_WIDTH * MOTION_HEIGHT;
+
+// ============================================================
+// OTA State
+// ============================================================
+static bool     otaInProgress = false;
+static int      otaProgress   = 0;
+static String   otaError      = "";
+static uint32_t otaLastUpdate = 0;
 
 // ============================================================
 // Camera Init
@@ -85,41 +96,16 @@ void initCamera() {
 // ============================================================
 // Bilinear Downscale JPEG → Grayscale
 // ============================================================
-// Decodes JPEG to RGB565, then downscales to grayscale.
-// We use the hardware JPEG decoder and do a fast box-filter downsample.
-// For a QVGA (320x240) → 80x60 that's a 4x4 box per output pixel.
 
 static bool jpegToGrayscale(camera_fb_t *fb, uint8_t *outBuf) {
-  // Temporarily switch to grayscale to get raw luma
-  // We'll use a second camera capture in grayscale mode
-  // Instead: decode the JPEG via ESP32's built-in decoder
-
-  // Simple approach: use fmt2rgb888 then average
-  // But that needs a 320*240*3 = 230KB buffer — too much.
-  // Better: capture a separate low-res grayscale frame.
-  // Most efficient: use two frame buffers and switch pixel format.
-
-  // Actually, the cleanest approach for the ESP32-S3 is to use
-  // the JPEG decoder built into esp_camera. Let's decode to RGB565
-  // in a small temp buffer, then downsample.
-
-  // For efficiency, we'll use a line-by-line approach.
-  // But the simplest working approach: just capture in grayscale.
-  // We can't switch pixel_format on the fly without reinit.
-  
-  // PRAGMATIC SOLUTION: Use the JPEG data directly.
-  // Decode JPEG → RGB888 using fmt2rgb888, then downsample.
-  // We allocate from PSRAM which the ESP32-S3 has.
-
   uint8_t *rgb = (uint8_t *)ps_malloc(FRAME_WIDTH * FRAME_HEIGHT * 3);
   if (!rgb) return false;
 
   bool ok = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, rgb);
   if (!ok) { free(rgb); return false; }
 
-  // Box-filter downsample to grayscale
-  int scaleX = FRAME_WIDTH / MOTION_WIDTH;    // 4
-  int scaleY = FRAME_HEIGHT / MOTION_HEIGHT;   // 4
+  int scaleX = FRAME_WIDTH / MOTION_WIDTH;
+  int scaleY = FRAME_HEIGHT / MOTION_HEIGHT;
 
   for (int oy = 0; oy < MOTION_HEIGHT; oy++) {
     for (int ox = 0; ox < MOTION_WIDTH; ox++) {
@@ -130,7 +116,6 @@ static bool jpegToGrayscale(camera_fb_t *fb, uint8_t *outBuf) {
           int sx = ox * scaleX + dx;
           int sy = oy * scaleY + dy;
           int idx = (sy * FRAME_WIDTH + sx) * 3;
-          // Luminance: 0.299R + 0.587G + 0.114B (integer approx)
           uint32_t lum = (rgb[idx] * 77 + rgb[idx+1] * 150 + rgb[idx+2] * 29) >> 8;
           sum += lum;
           count++;
@@ -149,7 +134,7 @@ static bool jpegToGrayscale(camera_fb_t *fb, uint8_t *outBuf) {
 // ============================================================
 
 static void runMotionDetection() {
-  if (!motionEnabled) return;
+  if (!motionEnabled || otaInProgress) return;
 
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return;
@@ -158,13 +143,11 @@ static void runMotionDetection() {
   esp_camera_fb_return(fb);
   if (!ok) return;
 
-  // If no reference frame yet, copy current as reference
   if (refFrame[0] == 0 && refFrame[1] == 0 && refFrame[2] == 0) {
     memcpy(refFrame, curFrame, DETECT_PIXELS);
     return;
   }
 
-  // Count pixels that differ by more than threshold
   int changedPixels = 0;
   for (int i = 0; i < DETECT_PIXELS; i++) {
     int diff = abs((int)curFrame[i] - (int)refFrame[i]);
@@ -182,15 +165,59 @@ static void runMotionDetection() {
                   motionScore, changedPixels, DETECT_PIXELS);
   }
 
-  // Exponential moving average: blend reference toward current
-  // This adapts to slow lighting changes while still detecting fast motion.
-  // alpha = 0.05 (5% new frame blended each cycle)
   for (int i = 0; i < DETECT_PIXELS; i++) {
     refFrame[i] = (uint8_t)((refFrame[i] * 243 + curFrame[i] * 13) >> 8);
-    // 243/256 ≈ 0.95, 13/256 ≈ 0.05
   }
 
   lastDetectTime = millis();
+}
+
+// ============================================================
+// OTA Setup
+// ============================================================
+
+void setupOTA() {
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  ArduinoOTA.setPort(OTA_PORT);
+
+  ArduinoOTA.onStart([]() {
+    otaInProgress = true;
+    otaProgress = 0;
+    otaError = "";
+    String type = (ArduinoOTA.getCommand() == U_FLASH) ? "firmware" : "filesystem";
+    Serial.printf("OTA Start: %s\n", type.c_str());
+  });
+
+  ArduinoOTA.onEnd([]() {
+    otaInProgress = false;
+    otaProgress = 100;
+    Serial.println("\nOTA Complete — rebooting");
+  });
+
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    otaProgress = (progress * 100) / total;
+    // Print progress every 10%
+    if (millis() - otaLastUpdate > 500) {
+      Serial.printf("OTA: %u%%\r", otaProgress);
+      otaLastUpdate = millis();
+    }
+  });
+
+  ArduinoOTA.onError([](ota_error_t error) {
+    otaInProgress = false;
+    switch (error) {
+      case OTA_AUTH_ERROR:    otaError = "Auth Failed";    break;
+      case OTA_BEGIN_ERROR:   otaError = "Begin Failed";   break;
+      case OTA_CONNECT_ERROR: otaError = "Connect Failed"; break;
+      case OTA_RECEIVE_ERROR: otaError = "Receive Failed"; break;
+      case OTA_END_ERROR:     otaError = "End Failed";     break;
+      default:                otaError = "Unknown";        break;
+    }
+    Serial.printf("OTA Error[%u]: %s\n", error, otaError.c_str());
+  });
+
+  ArduinoOTA.begin();
+  Serial.printf("OTA ready on port %d (hostname: %s)\n", OTA_PORT, OTA_HOSTNAME);
 }
 
 // ============================================================
@@ -209,6 +236,12 @@ void handleStream() {
 
   while (client.connected()) {
     unsigned long frameStart = millis();
+
+    // During OTA, pause streaming to free bandwidth
+    if (otaInProgress) {
+      delay(100);
+      continue;
+    }
 
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) continue;
@@ -231,8 +264,6 @@ void handleStream() {
 }
 
 void handleMotion() {
-  // Return motion state as JSON
-  // The GIGA polls this endpoint to get real detection data
   char json[256];
   snprintf(json, sizeof(json),
     "{\"detected\":%s,"
@@ -256,7 +287,6 @@ void handleMotion() {
 }
 
 void handleMotionConfig() {
-  // POST /motion with query params to configure
   if (server.hasArg("pixel_threshold")) {
     pixelThreshold = constrain(server.arg("pixel_threshold").toInt(), 1, 100);
   }
@@ -267,7 +297,6 @@ void handleMotionConfig() {
     motionEnabled = (server.arg("enabled") == "1" || server.arg("enabled") == "true");
   }
   if (server.hasArg("reset")) {
-    // Reset reference frame — forces recalibration
     memset(refFrame, 0, DETECT_PIXELS);
     motionDetected = false;
     motionScore = 0;
@@ -277,7 +306,72 @@ void handleMotionConfig() {
   Serial.printf("Motion config: pixel=%d, percent=%d%%, enabled=%s\n",
     pixelThreshold, percentThreshold, motionEnabled ? "yes" : "no");
 
-  handleMotion(); // Return current state
+  handleMotion();
+}
+
+void handleOtaStatus() {
+  char json[192];
+  snprintf(json, sizeof(json),
+    "{\"ready\":true,"
+    "\"inProgress\":%s,"
+    "\"progress\":%d,"
+    "\"error\":\"%s\","
+    "\"hostname\":\"%s\","
+    "\"port\":%d,"
+    "\"freeHeap\":%lu,"
+    "\"uptime\":%lu}",
+    otaInProgress ? "true" : "false",
+    otaProgress,
+    otaError.c_str(),
+    OTA_HOSTNAME,
+    OTA_PORT,
+    (unsigned long)ESP.getFreeHeap(),
+    millis() / 1000);
+
+  server.send(200, "application/json", json);
+}
+
+// HTTP-based OTA upload endpoint (alternative to ArduinoOTA mDNS)
+void handleOtaUpload() {
+  HTTPUpload &upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    otaInProgress = true;
+    otaProgress = 0;
+    otaError = "";
+    Serial.printf("HTTP OTA Start: %s\n", upload.filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      otaError = "Begin failed";
+      Serial.println(otaError);
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      otaError = "Write failed";
+      Serial.println(otaError);
+    }
+    otaProgress = (Update.progress() * 100) / Update.size();
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) {
+      otaProgress = 100;
+      Serial.printf("HTTP OTA Success: %u bytes\n", upload.totalSize);
+    } else {
+      otaError = "End failed";
+      Serial.println(otaError);
+    }
+    otaInProgress = false;
+  }
+}
+
+void handleOtaUploadDone() {
+  if (otaError.length() > 0) {
+    char json[128];
+    snprintf(json, sizeof(json), "{\"success\":false,\"error\":\"%s\"}", otaError.c_str());
+    server.send(500, "application/json", json);
+  } else {
+    server.send(200, "application/json", "{\"success\":true,\"message\":\"Rebooting...\"}");
+    delay(500);
+    ESP.restart();
+  }
 }
 
 void handleRoot() {
@@ -285,8 +379,14 @@ void handleRoot() {
                 "<h1>GigaSenseHub Camera Node</h1>"
                 "<p><a href=\"" STREAM_PATH "\">MJPEG Stream</a></p>"
                 "<p><a href=\"" MOTION_PATH "\">Motion Status (JSON)</a></p>"
+                "<p><a href=\"" OTA_STATUS_PATH "\">OTA Status (JSON)</a></p>"
                 "<p>Motion: " + String(motionDetected ? "DETECTED" : "clear") +
                 " (" + String(motionScore, 1) + "% changed)</p>"
+                "<hr><h2>OTA Firmware Update</h2>"
+                "<form method='POST' action='" OTA_UPLOAD_PATH "' enctype='multipart/form-data'>"
+                "<input type='file' name='firmware' accept='.bin'>"
+                "<input type='submit' value='Upload'>"
+                "</form>"
                 "</body></html>";
   server.send(200, "text/html", html);
 }
@@ -300,6 +400,7 @@ void setup() {
   delay(1000);
   Serial.println("\n=== GigaSenseHub Camera Node ===");
   Serial.println("Motion detection: frame differencing (80x60 grayscale)");
+  Serial.printf("Firmware: %s (built %s %s)\n", FW_VERSION, __DATE__, __TIME__);
 
   // Allocate motion detection buffers in PSRAM
   refFrame = (uint8_t *)ps_calloc(DETECT_PIXELS, 1);
@@ -315,11 +416,14 @@ void setup() {
   Serial.println(WiFi.softAPIP());
 
   initCamera();
+  setupOTA();
 
   server.on("/", handleRoot);
   server.on(STREAM_PATH, HTTP_GET, handleStream);
   server.on(MOTION_PATH, HTTP_GET, handleMotion);
   server.on(MOTION_PATH, HTTP_POST, handleMotionConfig);
+  server.on(OTA_STATUS_PATH, HTTP_GET, handleOtaStatus);
+  server.on(OTA_UPLOAD_PATH, HTTP_POST, handleOtaUploadDone, handleOtaUpload);
   server.begin();
   Serial.println("HTTP server started");
 }
@@ -328,9 +432,9 @@ static unsigned long lastDetect = 0;
 
 void loop() {
   server.handleClient();
+  ArduinoOTA.handle();
 
-  // Run motion detection ~4 times per second (250ms interval)
-  // This doesn't interfere with streaming — the camera has 2 framebuffers.
+  // Run motion detection ~4 times per second
   if (millis() - lastDetect >= 250) {
     lastDetect = millis();
     runMotionDetection();
