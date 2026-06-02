@@ -1,0 +1,12 @@
+(kicad_pro
+  (version 1)
+  (generator "GigaSenseHub")
+  (generator_version "8.0")
+  (project
+    (name "giga-sense-hub")
+  )
+  (schematic
+    (legacy_lib_dir "")
+    (legacy_lib_list ())
+  )
+)

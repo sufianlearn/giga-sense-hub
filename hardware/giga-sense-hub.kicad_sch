@@ -1,0 +1,376 @@
+(kicad_sch
+  (version 20231120)
+  (generator "GigaSenseHub")
+  (generator_version "8.0")
+  (uuid "a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+  (paper "A3")
+  (title_block
+    (title "GigaSenseHub — Multi-Node Camera System")
+    (date "2026-06-02")
+    (rev "1.0")
+    (company "Sufian Abrar")
+    (comment 1 "GIGA R1 WiFi + 2x XIAO ESP32-S3 Sense")
+    (comment 2 "WiFi AP Architecture — 802.11n")
+    (comment 3 "Power: USB 5V per board")
+  )
+
+  (lib_symbols
+  )
+
+  ;; ============================================================
+  ;; POWER RAILS
+  ;; ============================================================
+
+  ;; USB 5V Power Input — GIGA
+  (label "USB_5V_GIGA"
+    (at 50 30 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "pwr-001")
+  )
+
+  ;; USB 5V Power Input — ESP32 Node 0
+  (label "USB_5V_NODE0"
+    (at 50 170 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "pwr-002")
+  )
+
+  ;; USB 5V Power Input — ESP32 Node 1
+  (label "USB_5V_NODE1"
+    (at 50 250 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "pwr-003")
+  )
+
+  ;; ============================================================
+  ;; GIGA R1 WiFi — Main Hub (U1)
+  ;; ============================================================
+  (text "ARDUINO GIGA R1 WiFi (STM32H747XI)"
+    (at 120 20 0)
+    (effects (font (size 2.54 2.54) bold))
+    (uuid "txt-u1-title")
+  )
+  (text "Dual-core Cortex-M7 (480MHz) + M4 (240MHz)"
+    (at 120 25 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u1-cpu")
+  )
+  (text "WiFi: Murata 1DX (CYW4343W) — 802.11b/g/n"
+    (at 120 29 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u1-wifi")
+  )
+  (text "Role: Access Point (SSID: GigaSenseHub, Ch 6)"
+    (at 120 33 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u1-role")
+  )
+  (text "IP: 192.168.3.1 (DHCP server)"
+    (at 120 37 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u1-ip")
+  )
+  (text "Flash: 2MB internal + 16MB QSPI"
+    (at 120 41 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u1-flash")
+  )
+  (text "SDRAM: 8MB (MJPEG decode + LVGL framebuffers)"
+    (at 120 45 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u1-sdram")
+  )
+  (text "Settings: FlashIAP @ 0x081E0000 (CRC32)"
+    (at 120 49 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u1-settings")
+  )
+
+  ;; ============================================================
+  ;; GIGA DISPLAY SHIELD (U2)
+  ;; ============================================================
+  (text "GIGA Display Shield"
+    (at 280 20 0)
+    (effects (font (size 2.54 2.54) bold))
+    (uuid "txt-u2-title")
+  )
+  (text "800x480 TFT — RGB565 parallel interface"
+    (at 280 25 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u2-tft")
+  )
+  (text "Capacitive touch (GT911 I2C)"
+    (at 280 29 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u2-touch")
+  )
+  (text "IMU: BMI270 (6-axis accel+gyro, SPI)"
+    (at 280 33 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u2-imu")
+  )
+  (text "Microphone: MP34DT06JTR (PDM)"
+    (at 280 37 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u2-mic")
+  )
+  (text "LVGL 9 UI framework — 4 pages"
+    (at 280 41 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u2-lvgl")
+  )
+
+  ;; ============================================================
+  ;; XIAO ESP32-S3 Sense — Node 0 (U3)
+  ;; ============================================================
+  (text "XIAO ESP32-S3 Sense — Node 0"
+    (at 120 100 0)
+    (effects (font (size 2.54 2.54) bold))
+    (uuid "txt-u3-title")
+  )
+  (text "Xtensa LX7 dual-core @ 240MHz"
+    (at 120 105 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u3-cpu")
+  )
+  (text "WiFi: ESP32-S3 integrated — 802.11b/g/n"
+    (at 120 109 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u3-wifi")
+  )
+  (text "Role: STA → 192.168.3.x (DHCP)"
+    (at 120 113 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u3-role")
+  )
+  (text "Camera: OV2640 (QVGA 320x240 @ 15fps JPEG)"
+    (at 120 117 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u3-cam")
+  )
+  (text "PSRAM: 8MB OPI (motion detection buffers)"
+    (at 120 121 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u3-psram")
+  )
+  (text "Flash: 8MB QIO"
+    (at 120 125 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u3-flash")
+  )
+  (text "HTTP: /stream, /motion, /info, /ota/*"
+    (at 120 129 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u3-http")
+  )
+  (text "Power: Active(240MHz) → Light(80MHz) → Deep Sleep"
+    (at 120 133 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u3-pwr")
+  )
+  (text "OTA: ArduinoOTA port 3232"
+    (at 120 137 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u3-ota")
+  )
+
+  ;; ============================================================
+  ;; XIAO ESP32-S3 Sense — Node 1 (U4)
+  ;; ============================================================
+  (text "XIAO ESP32-S3 Sense — Node 1"
+    (at 120 160 0)
+    (effects (font (size 1.27 1.27) bold))
+    (uuid "txt-u4-title")
+  )
+  (text "(Identical to Node 0, NODE_ID=1)"
+    (at 120 164 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u4-note")
+  )
+  (text "Role: STA → 192.168.3.x (DHCP)"
+    (at 120 168 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-u4-role")
+  )
+
+  ;; ============================================================
+  ;; WiFi NETWORK TOPOLOGY
+  ;; ============================================================
+  (text "═══════ WiFi Network ═══════"
+    (at 300 90 0)
+    (effects (font (size 2.54 2.54) bold))
+    (uuid "txt-net-title")
+  )
+  (text "SSID: GigaSenseHub"
+    (at 300 95 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-net-ssid")
+  )
+  (text "Security: WPA2-PSK"
+    (at 300 99 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-net-sec")
+  )
+  (text "Channel: 6"
+    (at 300 103 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-net-ch")
+  )
+  (text "Topology: Star (GIGA AP → N ESP32 STAs)"
+    (at 300 107 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-net-topo")
+  )
+  (text "GIGA (AP) ← MJPEG/HTTP → Node 0 (STA)"
+    (at 300 115 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-net-link0")
+  )
+  (text "GIGA (AP) ← MJPEG/HTTP → Node 1 (STA)"
+    (at 300 119 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-net-link1")
+  )
+  (text "Node scan: HTTP GET /info (500ms timeout)"
+    (at 300 123 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-net-scan")
+  )
+  (text "Stream: MJPEG multipart @ 15fps"
+    (at 300 127 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-net-stream")
+  )
+
+  ;; ============================================================
+  ;; PROTOCOLS & INTERFACES
+  ;; ============================================================
+  (text "═══════ Interfaces ═══════"
+    (at 300 145 0)
+    (effects (font (size 2.54 2.54) bold))
+    (uuid "txt-iface-title")
+  )
+  (text "GIGA ↔ Display Shield: 40-pin parallel RGB565"
+    (at 300 150 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-iface-rgb")
+  )
+  (text "GIGA ↔ Touch: I2C (GT911 @ 0x5D)"
+    (at 300 154 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-iface-touch")
+  )
+  (text "GIGA ↔ IMU: SPI (BMI270 interrupt-driven)"
+    (at 300 158 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-iface-imu")
+  )
+  (text "ESP32 ↔ Camera: DVP 8-bit parallel (OV2640)"
+    (at 300 162 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-iface-cam")
+  )
+  (text "ESP32 ↔ PSRAM: OPI (8-bit, 80MHz)"
+    (at 300 166 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-iface-psram")
+  )
+
+  ;; ============================================================
+  ;; POWER DISTRIBUTION
+  ;; ============================================================
+  (text "═══════ Power ═══════"
+    (at 50 200 0)
+    (effects (font (size 2.54 2.54) bold))
+    (uuid "txt-pwr-title")
+  )
+  (text "GIGA R1: USB-C 5V/500mA → onboard 3.3V LDO"
+    (at 50 205 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-pwr-giga")
+  )
+  (text "ESP32 Node 0: USB-C 5V/500mA → onboard 3.3V LDO"
+    (at 50 209 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-pwr-n0")
+  )
+  (text "ESP32 Node 1: USB-C 5V/500mA → onboard 3.3V LDO"
+    (at 50 213 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-pwr-n1")
+  )
+  (text "Display Shield: Powered from GIGA 5V header"
+    (at 50 217 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-pwr-disp")
+  )
+  (text "Total system: ~2.5W active, ~0.5W sleep"
+    (at 50 221 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-pwr-total")
+  )
+  (text "ESP32 power states:"
+    (at 50 227 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-pwr-states")
+  )
+  (text "  ACTIVE: 240MHz, WiFi+Camera = ~180mA"
+    (at 50 231 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-pwr-active")
+  )
+  (text "  LIGHT:  80MHz, WiFi only = ~80mA"
+    (at 50 235 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-pwr-light")
+  )
+  (text "  DEEP:   Timer wakeup = ~10µA"
+    (at 50 239 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-pwr-deep")
+  )
+
+  ;; ============================================================
+  ;; FIRMWARE MEMORY MAP
+  ;; ============================================================
+  (text "═══════ GIGA Memory Map ═══════"
+    (at 300 200 0)
+    (effects (font (size 2.54 2.54) bold))
+    (uuid "txt-mem-title")
+  )
+  (text "0x0800_0000 — Firmware Bank 1 (1MB)"
+    (at 300 205 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-mem-fw1")
+  )
+  (text "0x0810_0000 — Firmware Bank 2 (1MB)"
+    (at 300 209 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-mem-fw2")
+  )
+  (text "0x081E_0000 — Settings (FlashIAP, CRC32)"
+    (at 300 213 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-mem-settings")
+  )
+  (text "SDRAM 0x6000_0000 — 8MB:"
+    (at 300 219 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-mem-sdram")
+  )
+  (text "  LVGL framebuffers (800x480x2 = 768KB x2)"
+    (at 300 223 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-mem-fb")
+  )
+  (text "  JPEG decode buffer (32KB)"
+    (at 300 227 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-mem-jpeg")
+  )
+  (text "  Camera RGB565 framebuffer (320x240x2 = 150KB)"
+    (at 300 231 0)
+    (effects (font (size 1.27 1.27)))
+    (uuid "txt-mem-cam")
+  )
+)
