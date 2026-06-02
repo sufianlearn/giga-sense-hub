@@ -70,7 +70,7 @@ AppPage currentPage = PAGE_LOGIN;
 #define settings storageSettings()
 
 // WiFi / Stream
-WiFiClient streamClient;
+// Global streamClient removed — each CameraNode has its own .streamClient
 WiFiClient motionClient;
 bool streamConnected = false;
 bool wifiConnected = false;
@@ -101,8 +101,11 @@ static int jpegLen = 0;
 // Video buffer
 #define CAM_W FRAME_WIDTH
 #define CAM_H FRAME_HEIGHT
-static uint16_t *camFrameBuf = nullptr;
+static uint16_t *camFrameBuf  = nullptr;  // Cam 0 (or active single-view cam)
+static uint16_t *camFrameBuf1 = nullptr;  // Cam 1 (grid view only)
 static lv_image_dsc_t camImgDsc;
+static lv_image_dsc_t camImgDsc1;         // Second camera descriptor
+static bool gridMode = false;             // false=single cam, true=side-by-side
 
 // ============================================================
 // LVGL Screen Objects
@@ -119,7 +122,11 @@ static char pinEntry[5] = "";
 static int pinPos = 0;
 
 // Dashboard page
-static lv_obj_t *camImg = nullptr;
+static lv_obj_t *camImg = nullptr;       // Single-view or grid cam 0
+static lv_obj_t *camImg1 = nullptr;      // Grid cam 1
+static lv_obj_t *camRow = nullptr;       // Row container for grid images
+static lv_obj_t *btnGrid = nullptr;      // Grid/single toggle button
+static lv_obj_t *lblGrid = nullptr;      // Grid button label
 static lv_obj_t *lblFps;
 static lv_obj_t *lblStreamStatus;
 static lv_obj_t *swDoor[3];
@@ -172,7 +179,7 @@ static unsigned long lastNodeScan = 0;
 // ============================================================
 // JPEG Decoder
 // ============================================================
-struct JpegSession { const uint8_t *data; int len; int pos; };
+struct JpegSession { const uint8_t *data; int len; int pos; uint16_t *targetBuf; };
 
 static unsigned int tjpg_input(JDEC *jd, uint8_t *buf, unsigned int n) {
   JpegSession *s = (JpegSession *)jd->device;
@@ -185,12 +192,14 @@ static unsigned int tjpg_input(JDEC *jd, uint8_t *buf, unsigned int n) {
 
 static int tjpg_output(JDEC *jd, void *bmp, JRECT *r) {
   uint16_t *px = (uint16_t *)bmp;
-  if (!camFrameBuf) return 0;
+  JpegSession *s = (JpegSession *)jd->device;
+  uint16_t *fb = s->targetBuf;
+  if (!fb) return 0;
   for (int y = r->top; y <= r->bottom; y++)
     for (int x = r->left; x <= r->right; x++) {
       if ((unsigned)x < CAM_W && (unsigned)y < CAM_H) {
         uint16_t c = *px;
-        camFrameBuf[y * CAM_W + x] = (c >> 8) | (c << 8);
+        fb[y * CAM_W + x] = (c >> 8) | (c << 8);
       }
       px++;
     }
@@ -202,14 +211,14 @@ static int tjpg_output(JDEC *jd, void *bmp, JRECT *r) {
 #endif
 static uint8_t tjWork[TJPGD_WORKSPACE_SIZE];
 
-void decodeFrame() {
-  JpegSession sess = {jpegBuf, jpegLen, 0};
+void decodeFrame(uint16_t *fb, lv_image_dsc_t *dsc, lv_obj_t *img) {
+  JpegSession sess = {jpegBuf, jpegLen, 0, fb};
   JDEC jd;
   if (jd_prepare(&jd, tjpg_input, tjWork, TJPGD_WORKSPACE_SIZE, &sess) == JDR_OK) {
     jd_decomp(&jd, tjpg_output, 0);
-    if (camImg) {
-      lv_image_set_src(camImg, &camImgDsc);
-      lv_obj_invalidate(camImg);
+    if (img) {
+      lv_image_set_src(img, dsc);
+      lv_obj_invalidate(img);
     }
   }
 }
@@ -497,7 +506,8 @@ static void mkWinRow(lv_obj_t *p, int idx) {
 static void switchCamCb(lv_event_t *e) {
   (void)e;
   // Disconnect current stream
-  streamClient.stop();
+  nodes[activeNodeIdx].streamClient.stop();
+  nodes[activeNodeIdx].streamConnected = false;
   streamConnected = false;
   // Find next active node (wrap around)
   int start = activeNodeIdx;
@@ -515,6 +525,40 @@ static void switchCamCb(lv_event_t *e) {
   Serial.print("Switched to camera node "); Serial.print(activeNodeIdx);
   Serial.print(" IP: "); Serial.println(nodes[activeNodeIdx].ip);
   eventInfo("Camera switched");
+}
+
+// Toggle grid (dual) / single camera view
+static void toggleGridCb(lv_event_t *e) {
+  (void)e;
+  gridMode = !gridMode;
+  if (gridMode) {
+    // Show both images side-by-side, hide switch button
+    lv_label_set_text(lblGrid, LV_SYMBOL_IMAGE "  Single");
+    lv_label_set_text(lblCamTitle, LV_SYMBOL_VIDEO "  Grid View");
+    if (camImg) lv_obj_set_size(camImg, 160, 120);
+    if (camImg1) { lv_obj_clear_flag(camImg1, LV_OBJ_FLAG_HIDDEN); lv_obj_set_size(camImg1, 160, 120); }
+    // Disconnect single stream and connect both
+    for (int i = 0; i < MAX_NODES; i++) {
+      nodes[i].streamClient.stop();
+      nodes[i].streamConnected = false;
+    }
+    streamConnected = false;
+  } else {
+    // Single-cam mode: full size, hide second image
+    lv_label_set_text(lblGrid, LV_SYMBOL_IMAGE "  Grid");
+    char buf[32];
+    snprintf(buf, sizeof(buf), LV_SYMBOL_VIDEO "  Cam %d", activeNodeIdx);
+    lv_label_set_text(lblCamTitle, buf);
+    if (camImg) lv_obj_set_size(camImg, CAM_W, CAM_H);
+    if (camImg1) lv_obj_add_flag(camImg1, LV_OBJ_FLAG_HIDDEN);
+    // Disconnect all streams, let main loop reconnect to activeNodeIdx
+    for (int i = 0; i < MAX_NODES; i++) {
+      nodes[i].streamClient.stop();
+      nodes[i].streamConnected = false;
+    }
+    streamConnected = false;
+  }
+  Serial.print("Grid mode: "); Serial.println(gridMode ? "ON" : "OFF");
 }
 
 void buildDashboardPage() {
@@ -633,7 +677,34 @@ void buildDashboardPage() {
   lv_obj_center(swLbl);
   lv_obj_add_event_cb(btnSwitch, switchCamCb, LV_EVENT_CLICKED, nullptr);
 
-  // Video image
+  // Grid toggle button
+  btnGrid = lv_obj_create(ch);
+  lv_obj_set_size(btnGrid, 60, 18);
+  lv_obj_set_style_bg_color(btnGrid, C_PIN_BTN, 0);
+  lv_obj_set_style_bg_color(btnGrid, C_PIN_BTN_PR, LV_STATE_PRESSED);
+  lv_obj_set_style_bg_opa(btnGrid, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(btnGrid, 4, 0);
+  lv_obj_set_style_border_width(btnGrid, 0, 0);
+  lv_obj_set_style_pad_all(btnGrid, 0, 0);
+  lv_obj_clear_flag(btnGrid, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(btnGrid, LV_OBJ_FLAG_CLICKABLE);
+  lblGrid = lv_label_create(btnGrid);
+  lv_label_set_text(lblGrid, LV_SYMBOL_IMAGE "  Grid");
+  lv_obj_set_style_text_color(lblGrid, C_TEXT_DIM, 0);
+  lv_obj_center(lblGrid);
+  lv_obj_add_event_cb(btnGrid, toggleGridCb, LV_EVENT_CLICKED, nullptr);
+
+  // Camera image row container (for grid layout)
+  camRow = lv_obj_create(cc);
+  lv_obj_set_size(camRow, 350, LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_opa(camRow, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(camRow, 0, 0);
+  lv_obj_set_style_pad_all(camRow, 0, 0);
+  lv_obj_set_style_pad_column(camRow, 6, 0);
+  lv_obj_set_flex_flow(camRow, LV_FLEX_FLOW_ROW);
+  lv_obj_clear_flag(camRow, LV_OBJ_FLAG_SCROLLABLE);
+
+  // Video image — cam 0 / single view
   camFrameBuf = (uint16_t *)SDRAM.malloc(CAM_W * CAM_H * sizeof(uint16_t));
   if (camFrameBuf) {
     memset(camFrameBuf, 0, CAM_W * CAM_H * sizeof(uint16_t));
@@ -644,10 +715,28 @@ void buildDashboardPage() {
     camImgDsc.data_size = CAM_W * CAM_H * 2;
     camImgDsc.data = (const uint8_t *)camFrameBuf;
 
-    camImg = lv_image_create(cc);
+    camImg = lv_image_create(camRow);
     lv_image_set_src(camImg, &camImgDsc);
     lv_obj_set_style_radius(camImg, 4, 0);
     lv_obj_set_style_clip_corner(camImg, true, 0);
+  }
+
+  // Video image — cam 1 (grid view, hidden by default)
+  camFrameBuf1 = (uint16_t *)SDRAM.malloc(CAM_W * CAM_H * sizeof(uint16_t));
+  if (camFrameBuf1) {
+    memset(camFrameBuf1, 0, CAM_W * CAM_H * sizeof(uint16_t));
+    camImgDsc1.header.w = CAM_W;
+    camImgDsc1.header.h = CAM_H;
+    camImgDsc1.header.cf = LV_COLOR_FORMAT_RGB565;
+    camImgDsc1.header.stride = CAM_W * 2;
+    camImgDsc1.data_size = CAM_W * CAM_H * 2;
+    camImgDsc1.data = (const uint8_t *)camFrameBuf1;
+
+    camImg1 = lv_image_create(camRow);
+    lv_image_set_src(camImg1, &camImgDsc1);
+    lv_obj_set_style_radius(camImg1, 4, 0);
+    lv_obj_set_style_clip_corner(camImg1, true, 0);
+    lv_obj_add_flag(camImg1, LV_OBJ_FLAG_HIDDEN);  // Hidden until grid mode
   }
 
   lblStreamStatus = lv_label_create(cc);
@@ -1196,15 +1285,14 @@ void scanForNodes() {
   }
 }
 
-bool connectStream() {
-  // Connect to the active node's stream
-  if (activeNodeCount == 0) return false;
-  if (streamClient.connected()) return true;
-  CameraNode &node = nodes[activeNodeIdx];
+bool connectNodeStream(int idx) {
+  if (idx < 0 || idx >= MAX_NODES) return false;
+  CameraNode &node = nodes[idx];
   if (!node.active) return false;
-  Serial.print("Connecting stream to node "); Serial.print(activeNodeIdx);
+  if (node.streamClient.connected()) return true;
+  Serial.print("Connecting stream to node "); Serial.print(idx);
   Serial.print(" at "); Serial.println(node.ip);
-  if (!streamClient.connect(node.ip, STREAM_PORT)) {
+  if (!node.streamClient.connect(node.ip, STREAM_PORT)) {
     Serial.println("Stream connect failed!");
     return false;
   }
@@ -1221,35 +1309,45 @@ bool connectStream() {
     STREAM_PATH, node.ip.toString().c_str(),
     AUTH_HEADER, hmac,
     AUTH_NONCE_HEADER, nonce);
-  streamClient.print(req);
+  node.streamClient.print(req);
   unsigned long t = millis() + 5000;
   while (millis() < t) {
-    if (streamClient.available()) {
-      if (streamClient.readStringUntil('\n').startsWith("--" MJPEG_BOUNDARY)) {
-        streamConnected = true;
-        Serial.print("Stream connected to node "); Serial.println(activeNodeIdx);
+    if (node.streamClient.available()) {
+      if (node.streamClient.readStringUntil('\n').startsWith("--" MJPEG_BOUNDARY)) {
+        node.streamConnected = true;
+        Serial.print("Stream connected to node "); Serial.println(idx);
         return true;
       }
     }
   }
-  streamClient.stop(); return false;
+  node.streamClient.stop(); return false;
 }
 
-bool readFrame() {
-  if (!streamClient.connected()) { streamConnected = false; return false; }
+// Legacy wrapper for single-cam mode
+bool connectStream() {
+  streamConnected = false;
+  if (activeNodeCount == 0) return false;
+  bool ok = connectNodeStream(activeNodeIdx);
+  if (ok) streamConnected = true;
+  return ok;
+}
+
+bool readNodeFrame(int idx) {
+  CameraNode &node = nodes[idx];
+  if (!node.streamClient.connected()) { node.streamConnected = false; return false; }
   int clen = -1;
   unsigned long t = millis() + 3000;
   while (millis() < t) {
-    if (!streamClient.available()) { delay(1); continue; }
-    String l = streamClient.readStringUntil('\n'); l.trim();
+    if (!node.streamClient.available()) { delay(1); continue; }
+    String l = node.streamClient.readStringUntil('\n'); l.trim();
     if (l.length() == 0) break;
     if (l.startsWith("Content-Length:")) clen = l.substring(15).toInt();
   }
   if (clen <= 0 || clen > JPEG_BUF_SIZE) return false;
   int rd = 0; t = millis() + 3000;
   while (rd < clen && millis() < t) {
-    if (streamClient.available()) {
-      int g = streamClient.read(jpegBuf + rd, min((int)streamClient.available(), clen - rd));
+    if (node.streamClient.available()) {
+      int g = node.streamClient.read(jpegBuf + rd, min((int)node.streamClient.available(), clen - rd));
       if (g > 0) rd += g;
     } else delay(1);
   }
@@ -1257,12 +1355,17 @@ bool readFrame() {
   jpegLen = clen;
   t = millis() + 1000;
   while (millis() < t) {
-    if (streamClient.available()) {
-      String l = streamClient.readStringUntil('\n'); l.trim();
+    if (node.streamClient.available()) {
+      String l = node.streamClient.readStringUntil('\n'); l.trim();
       if (l.startsWith("--" MJPEG_BOUNDARY)) break;
     } else delay(1);
   }
   return true;
+}
+
+// Legacy wrapper
+bool readFrame() {
+  return readNodeFrame(activeNodeIdx);
 }
 
 // ============================================================
@@ -1503,14 +1606,34 @@ void loop() {
   // WiFi Stream — only on dashboard
   if (currentPage == PAGE_DASHBOARD) {
 
-    // Stream from active node
-    if (activeNodeCount > 0) {
-      if (!streamConnected) {
-        connectStream();
+    if (gridMode && activeNodeCount >= 2) {
+      // === GRID MODE: alternate between both nodes ===
+      static int gridRoundRobin = 0;
+      for (int pass = 0; pass < 2; pass++) {
+        int idx = (gridRoundRobin + pass) % MAX_NODES;
+        if (!nodes[idx].active) continue;
+        if (!nodes[idx].streamConnected) connectNodeStream(idx);
+        if (nodes[idx].streamConnected && readNodeFrame(idx)) {
+          uint16_t *fb = (idx == 0) ? camFrameBuf : camFrameBuf1;
+          lv_image_dsc_t *dsc = (idx == 0) ? &camImgDsc : &camImgDsc1;
+          lv_obj_t *img = (idx == 0) ? camImg : camImg1;
+          if (fb) decodeFrame(fb, dsc, img);
+          frameCount++;
+          break;  // One frame per loop iteration to keep UI responsive
+        }
       }
-      if (streamConnected && readFrame()) {
-        if (camFrameBuf) decodeFrame();
-        frameCount++;
+      gridRoundRobin = (gridRoundRobin + 1) % MAX_NODES;
+      streamConnected = nodes[0].streamConnected || nodes[1].streamConnected;
+    } else {
+      // === SINGLE MODE: stream from activeNodeIdx ===
+      if (activeNodeCount > 0) {
+        if (!streamConnected) {
+          connectStream();
+        }
+        if (streamConnected && readFrame()) {
+          if (camFrameBuf) decodeFrame(camFrameBuf, &camImgDsc, camImg);
+          frameCount++;
+        }
       }
     }
   }
