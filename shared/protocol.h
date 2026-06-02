@@ -59,4 +59,12 @@
 // --- MJPEG Boundary ---
 #define MJPEG_BOUNDARY "frame"
 
+// --- Power Management ---
+#define IDLE_LIGHT_SLEEP_MS   60000   // 60s no motion → light sleep (WiFi stays)
+#define IDLE_DEEP_SLEEP_MS   300000   // 5min no motion + no stream → deep sleep
+#define DEEP_SLEEP_WAKE_US  30000000  // Wake every 30s from deep sleep to check motion
+#define POWER_STATE_ACTIVE    0
+#define POWER_STATE_LIGHT     1
+#define POWER_STATE_DEEP      2
+
 #endif // GIGA_SENSE_PROTOCOL_H

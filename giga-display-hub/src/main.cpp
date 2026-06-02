@@ -485,7 +485,8 @@ static void switchCamCb(lv_event_t *e) {
   char buf[32];
   snprintf(buf, sizeof(buf), LV_SYMBOL_VIDEO "  Cam %d", activeNodeIdx);
   lv_label_set_text(lblCamTitle, buf);
-  Serial.print("Switched to camera node "); Serial.println(activeNodeIdx);
+  Serial.print("Switched to camera node "); Serial.print(activeNodeIdx);
+  Serial.print(" IP: "); Serial.println(nodes[activeNodeIdx].ip);
   eventInfo("Camera switched");
 }
 
@@ -1168,7 +1169,12 @@ bool connectStream() {
   if (streamClient.connected()) return true;
   CameraNode &node = nodes[activeNodeIdx];
   if (!node.active) return false;
-  if (!streamClient.connect(node.ip, STREAM_PORT)) return false;
+  Serial.print("Connecting stream to node "); Serial.print(activeNodeIdx);
+  Serial.print(" at "); Serial.println(node.ip);
+  if (!streamClient.connect(node.ip, STREAM_PORT)) {
+    Serial.println("Stream connect failed!");
+    return false;
+  }
   char req[128];
   snprintf(req, sizeof(req), "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive\r\n\r\n",
            STREAM_PATH, node.ip.toString().c_str());
@@ -1177,7 +1183,9 @@ bool connectStream() {
   while (millis() < t) {
     if (streamClient.available()) {
       if (streamClient.readStringUntil('\n').startsWith("--" MJPEG_BOUNDARY)) {
-        streamConnected = true; return true;
+        streamConnected = true;
+        Serial.print("Stream connected to node "); Serial.println(activeNodeIdx);
+        return true;
       }
     }
   }
