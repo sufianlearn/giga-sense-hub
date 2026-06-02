@@ -241,7 +241,7 @@ static void pinAppend(char c) {
   }
 
   if (pinPos == 4) {
-    if (strcmp(pinEntry, settings.pin) == 0) {
+    if (verifyPin(pinEntry, settings.pinHash)) {
       lv_label_set_text(lblLoginError, "");
       pinPos = 0;
       pinEntry[0] = '\0';
@@ -730,8 +730,8 @@ static void pinChangeCb(lv_event_t *e) {
   touchActivity();
   const char *newPin = lv_textarea_get_text(taNewPin);
   if (strlen(newPin) == 4) {
-    strncpy(settings.pin, newPin, 4);
-    settings.pin[4] = '\0';
+    hashPin(newPin, settings.pinHash);  // Store SHA-256 hash, not plaintext
+    memset(settings.pin, 0, sizeof(settings.pin));  // Clear deprecated field
     settings.crc32 = _storage_detail::settingsCrc(settings);
     storageSave(settings);
     lv_textarea_set_text(taNewPin, "");
@@ -1338,7 +1338,7 @@ void setup() {
 
   // Load persistent settings from flash (or defaults on first boot)
   storageInit();
-  Serial.print("Settings loaded — PIN: "); Serial.print(settings.pin);
+  Serial.print("Settings loaded — PIN: [SHA-256 hashed]");
   Serial.print(", AutoLock: "); Serial.print(settings.autoLockSecs);
   Serial.println("s");
 
