@@ -250,6 +250,8 @@ static void pinAppend(char c) {
 
       lastActivity = millis();
       currentPage = PAGE_DASHBOARD;
+      // Defer node scan so the page transition animation isn't blocked
+      lastNodeScan = millis();  // Prevent immediate scan
       lv_screen_load_anim(scrDashboard, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
       eventInfo("User logged in");
       Serial.println("Login OK -> Dashboard");
@@ -496,7 +498,7 @@ void buildDashboardPage() {
 
   // --- Top bar ---
   lv_obj_t *top = lv_obj_create(scrDashboard);
-  lv_obj_set_size(top, 800, 34);
+  lv_obj_set_size(top, 800, 50);
   lv_obj_set_pos(top, 0, 0);
   lv_obj_set_style_bg_color(top, C_CARD, 0);
   lv_obj_set_style_bg_opa(top, LV_OPA_COVER, 0);
@@ -517,17 +519,17 @@ void buildDashboardPage() {
 
   // Nav buttons container
   lv_obj_t *navRow = lv_obj_create(top);
-  lv_obj_set_size(navRow, LV_SIZE_CONTENT, 30);
+  lv_obj_set_size(navRow, LV_SIZE_CONTENT, 44);
   lv_obj_set_style_bg_opa(navRow, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(navRow, 0, 0);
   lv_obj_set_style_pad_all(navRow, 0, 0);
-  lv_obj_set_style_pad_column(navRow, 6, 0);
+  lv_obj_set_style_pad_column(navRow, 10, 0);
   lv_obj_set_flex_flow(navRow, LV_FLEX_FLOW_ROW);
   lv_obj_clear_flag(navRow, LV_OBJ_FLAG_SCROLLABLE);
 
   // Settings button (large touch target)
   lv_obj_t *btnSettings = lv_obj_create(navRow);
-  lv_obj_set_size(btnSettings, 60, 30);
+  lv_obj_set_size(btnSettings, 70, 40);
   lv_obj_set_style_bg_color(btnSettings, C_PIN_BTN, 0);
   lv_obj_set_style_bg_color(btnSettings, C_PIN_BTN_PR, LV_STATE_PRESSED);
   lv_obj_set_style_bg_opa(btnSettings, LV_OPA_COVER, 0);
@@ -543,7 +545,7 @@ void buildDashboardPage() {
 
   // Log button (large touch target)
   lv_obj_t *btnLog = lv_obj_create(navRow);
-  lv_obj_set_size(btnLog, 60, 30);
+  lv_obj_set_size(btnLog, 70, 40);
   lv_obj_set_style_bg_color(btnLog, C_PIN_BTN, 0);
   lv_obj_set_style_bg_color(btnLog, C_PIN_BTN_PR, LV_STATE_PRESSED);
   lv_obj_set_style_bg_opa(btnLog, LV_OPA_COVER, 0);
@@ -559,7 +561,7 @@ void buildDashboardPage() {
 
   // Lock/logout button (large touch target)
   lv_obj_t *btnLock = lv_obj_create(navRow);
-  lv_obj_set_size(btnLock, 60, 30);
+  lv_obj_set_size(btnLock, 70, 40);
   lv_obj_set_style_bg_color(btnLock, C_PIN_BTN, 0);
   lv_obj_set_style_bg_color(btnLock, C_PIN_BTN_PR, LV_STATE_PRESSED);
   lv_obj_set_style_bg_opa(btnLock, LV_OPA_COVER, 0);
@@ -577,7 +579,7 @@ void buildDashboardPage() {
 
   // Camera card
   lv_obj_t *cc = mkCard(scrDashboard, 370, 288);
-  lv_obj_set_pos(cc, 6, 40);
+  lv_obj_set_pos(cc, 6, 56);
   lv_obj_set_flex_flow(cc, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_gap(cc, 4, 0);
 
@@ -629,7 +631,7 @@ void buildDashboardPage() {
 
   // IMU card
   lv_obj_t *sc = mkCard(scrDashboard, 370, 128);
-  lv_obj_set_pos(sc, 6, 334);
+  lv_obj_set_pos(sc, 6, 350);
   lv_obj_set_flex_flow(sc, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_gap(sc, 3, 0);
 
@@ -649,7 +651,7 @@ void buildDashboardPage() {
 
   // Door locks
   lv_obj_t *lc = mkCard(scrDashboard, 412, 178);
-  lv_obj_set_pos(lc, 382, 40);
+  lv_obj_set_pos(lc, 382, 56);
   lv_obj_set_flex_flow(lc, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_gap(lc, 6, 0);
   mkTitle(lc, LV_SYMBOL_CLOSE "  Door Locks");
@@ -657,7 +659,7 @@ void buildDashboardPage() {
 
   // Windows
   lv_obj_t *wc = mkCard(scrDashboard, 412, 144);
-  lv_obj_set_pos(wc, 382, 224);
+  lv_obj_set_pos(wc, 382, 240);
   lv_obj_set_flex_flow(wc, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_gap(wc, 4, 0);
   mkTitle(wc, LV_SYMBOL_WARNING "  Window Sensors");
@@ -665,7 +667,7 @@ void buildDashboardPage() {
 
   // System card
   lv_obj_t *sysc = mkCard(scrDashboard, 412, 92);
-  lv_obj_set_pos(sysc, 382, 374);
+  lv_obj_set_pos(sysc, 382, 390);
   lv_obj_set_flex_flow(sysc, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_gap(sysc, 4, 0);
   mkTitle(sysc, LV_SYMBOL_SETTINGS "  System");
@@ -782,7 +784,7 @@ void buildSettingsPage() {
 
   // Top bar
   lv_obj_t *top = lv_obj_create(scrSettings);
-  lv_obj_set_size(top, 800, 34);
+  lv_obj_set_size(top, 800, 50);
   lv_obj_set_pos(top, 0, 0);
   lv_obj_set_style_bg_color(top, C_CARD, 0);
   lv_obj_set_style_bg_opa(top, LV_OPA_COVER, 0);
@@ -796,7 +798,7 @@ void buildSettingsPage() {
 
   // Back button (large touch target)
   lv_obj_t *btnBack = lv_obj_create(top);
-  lv_obj_set_size(btnBack, 60, 30);
+  lv_obj_set_size(btnBack, 70, 40);
   lv_obj_set_style_bg_color(btnBack, C_PIN_BTN, 0);
   lv_obj_set_style_bg_opa(btnBack, LV_OPA_COVER, 0);
   lv_obj_set_style_radius(btnBack, 4, 0);
@@ -815,7 +817,7 @@ void buildSettingsPage() {
 
   // === LEFT: Camera & Security Settings ===
   lv_obj_t *leftCard = mkCard(scrSettings, 380, 420);
-  lv_obj_set_pos(leftCard, 6, 42);
+  lv_obj_set_pos(leftCard, 6, 56);
   lv_obj_set_flex_flow(leftCard, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_gap(leftCard, 6, 0);
 
@@ -893,7 +895,7 @@ void buildSettingsPage() {
 
   // === RIGHT: WiFi & System Info ===
   lv_obj_t *rightCard = mkCard(scrSettings, 400, 200);
-  lv_obj_set_pos(rightCard, 392, 42);
+  lv_obj_set_pos(rightCard, 392, 56);
   lv_obj_set_flex_flow(rightCard, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_gap(rightCard, 6, 0);
 
@@ -1021,7 +1023,7 @@ void buildLogPage() {
 
   // Top bar
   lv_obj_t *top = lv_obj_create(scrLog);
-  lv_obj_set_size(top, 800, 34);
+  lv_obj_set_size(top, 800, 50);
   lv_obj_set_pos(top, 0, 0);
   lv_obj_set_style_bg_color(top, C_CARD, 0);
   lv_obj_set_style_bg_opa(top, LV_OPA_COVER, 0);
@@ -1035,7 +1037,7 @@ void buildLogPage() {
 
   // Back button
   lv_obj_t *btnBack = lv_obj_create(top);
-  lv_obj_set_size(btnBack, 60, 30);
+  lv_obj_set_size(btnBack, 70, 40);
   lv_obj_set_style_bg_color(btnBack, C_PIN_BTN, 0);
   lv_obj_set_style_bg_opa(btnBack, LV_OPA_COVER, 0);
   lv_obj_set_style_radius(btnBack, 4, 0);
@@ -1059,8 +1061,8 @@ void buildLogPage() {
   lv_obj_set_style_text_align(lblLogCount, LV_TEXT_ALIGN_RIGHT, 0);
 
   // Scrollable log list
-  lv_obj_t *card = mkCard(scrLog, 788, 430);
-  lv_obj_set_pos(card, 6, 40);
+  lv_obj_t *card = mkCard(scrLog, 788, 414);
+  lv_obj_set_pos(card, 6, 56);
   lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_gap(card, 2, 0);
   lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE);
@@ -1105,7 +1107,7 @@ void connectWiFi() {
 // Non-destructive: only updates nodes that respond, marks unreachable ones inactive
 void scanForNodes() {
   WiFiClient probe;
-  probe.setTimeout(500);  // Short timeout — we're blocking the main loop
+  probe.setTimeout(300);  // Short timeout — we're blocking the main loop
   int foundCount = 0;
   for (int i = 0; i < MAX_NODES; i++) {
     IPAddress ip(192, 168, 3, 2 + i);
