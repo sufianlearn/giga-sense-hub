@@ -126,6 +126,23 @@ static float    camMotionScore    = 0.0f;
 static uint32_t camMotionCount    = 0;
 static unsigned long lastCamPoll  = 0;
 
+// Multi-node registry
+struct CameraNode {
+  bool        active;
+  IPAddress   ip;
+  int         nodeId;
+  char        firmware[16];
+  int         rssi;
+  bool        motionDetected;
+  float       motionScore;
+  WiFiClient  streamClient;
+  bool        streamConnected;
+};
+static CameraNode nodes[MAX_NODES];
+static int activeNodeCount = 0;
+static int activeNodeIdx   = 0;  // Currently displayed node (for stream)
+static unsigned long lastNodeScan = 0;
+
 // ============================================================
 // JPEG Decoder
 // ============================================================
@@ -1013,18 +1030,94 @@ void buildLogPage() {
 // ============================================================
 
 void connectWiFi() {
-  WiFi.begin(AP_SSID, AP_PASSWORD);
-  int att = 0;
-  while (WiFi.status() != WL_CONNECTED && att < 30) { delay(500); att++; }
-  wifiConnected = (WiFi.status() == WL_CONNECTED);
-  if (wifiConnected) { Serial.print("WiFi OK: "); Serial.println(WiFi.localIP()); }
+  // GIGA runs as Access Point — ESP32 nodes connect to us
+  // Check WiFi module presence first
+  if (WiFi.status() == WL_NO_MODULE) {
+    Serial.println("WiFi module not found!");
+    wifiConnected = false;
+    return;
+  }
+  // Configure AP IP before starting (required by mbed WiFi)
+  WiFi.config(IPAddress(192, 168, 3, 1));
+  // Arduino mbed WiFi uses beginAP() (not softAP)
+  int status = WiFi.beginAP(AP_SSID, AP_PASSWORD, AP_CHANNEL);
+  Serial.print("WiFi AP status: "); Serial.println(status);
+  if (status == WL_AP_LISTENING) {
+    wifiConnected = true;
+    Serial.print("WiFi AP started — SSID: "); Serial.print(AP_SSID);
+    Serial.print(" IP: "); Serial.println(GIGA_AP_IP);
+  } else {
+    wifiConnected = false;
+    Serial.print("WiFi AP FAILED — status: "); Serial.println(status);
+  }
+  // Initialize nodes
+  for (int i = 0; i < MAX_NODES; i++) {
+    nodes[i].active = false;
+    nodes[i].streamConnected = false;
+  }
+}
+
+// Scan for camera nodes on the AP network
+void scanForNodes() {
+  WiFiClient probe;
+  probe.setTimeout(1000);  // 1-second connect timeout
+  activeNodeCount = 0;
+  for (int i = 0; i < MAX_NODES; i++) {
+    IPAddress ip(192, 168, 3, 2 + i);
+    if (probe.connect(ip, STREAM_PORT)) {
+      probe.print("GET " NODE_INFO_PATH " HTTP/1.0\r\nHost: ");
+      probe.print(ip); probe.print("\r\n\r\n");
+      unsigned long t = millis();
+      while (!probe.available() && millis() - t < 1000) delay(10);
+      // Read response
+      String body = "";
+      bool hdr = true;
+      while (probe.available()) {
+        String line = probe.readStringUntil('\n');
+        if (hdr && (line == "\r" || line.length() == 0)) { hdr = false; continue; }
+        if (!hdr) body += line;
+      }
+      probe.stop();
+
+      // Parse nodeId from JSON
+      int nidIdx = body.indexOf("\"nodeId\":");
+      if (nidIdx >= 0) {
+        int nid = body.substring(nidIdx + 9, body.indexOf(',', nidIdx + 9)).toInt();
+        if (nid >= 0 && nid < MAX_NODES) {
+          nodes[nid].active = true;
+          nodes[nid].ip = ip;
+          nodes[nid].nodeId = nid;
+          activeNodeCount++;
+
+          // Parse RSSI
+          int rIdx = body.indexOf("\"rssi\":");
+          if (rIdx >= 0) nodes[nid].rssi = body.substring(rIdx + 7, body.indexOf(',', rIdx)).toInt();
+
+          Serial.print("Found node "); Serial.print(nid);
+          Serial.print(" at "); Serial.println(ip);
+        }
+      }
+    } else {
+      if (nodes[i].active) {
+        Serial.print("Node "); Serial.print(i); Serial.println(" lost");
+      }
+      nodes[i].active = false;
+      nodes[i].streamConnected = false;
+    }
+  }
 }
 
 bool connectStream() {
+  // Connect to the active node's stream
+  if (activeNodeCount == 0) return false;
   if (streamClient.connected()) return true;
-  IPAddress ip; ip.fromString(ESP32_IP);
-  if (!streamClient.connect(ip, STREAM_PORT)) return false;
-  streamClient.print("GET " STREAM_PATH " HTTP/1.1\r\nHost: " ESP32_IP "\r\nConnection: keep-alive\r\n\r\n");
+  CameraNode &node = nodes[activeNodeIdx];
+  if (!node.active) return false;
+  if (!streamClient.connect(node.ip, STREAM_PORT)) return false;
+  char req[128];
+  snprintf(req, sizeof(req), "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive\r\n\r\n",
+           STREAM_PATH, node.ip.toString().c_str());
+  streamClient.print(req);
   unsigned long t = millis() + 5000;
   while (millis() < t) {
     if (streamClient.available()) {
@@ -1081,10 +1174,11 @@ void updateDashboardUI() {
   lv_obj_set_style_text_color(lblStreamStatus, streamConnected ? C_GREEN : C_RED, 0);
 
   if (wifiConnected) {
-    snprintf(buf, sizeof(buf), LV_SYMBOL_WIFI " %s | %s",
-             WiFi.localIP().toString().c_str(), streamConnected ? "LIVE" : "NO STREAM");
+    snprintf(buf, sizeof(buf), LV_SYMBOL_WIFI " AP %s | %d nodes | %s",
+             GIGA_AP_IP, activeNodeCount,
+             streamConnected ? "LIVE" : "NO STREAM");
     lv_label_set_text(lblStatusBar, buf);
-    lv_obj_set_style_text_color(lblStatusBar, streamConnected ? C_GREEN : C_ORANGE, 0);
+    lv_obj_set_style_text_color(lblStatusBar, activeNodeCount > 0 ? C_GREEN : C_ORANGE, 0);
   }
 
   // IMU
@@ -1207,7 +1301,9 @@ void setup() {
   lv_screen_load(scrLogin);
   lv_timer_handler();
 
-  // Connect WiFi in background — don't block the login screen
+  // Connect WiFi AP — don't block the login screen
+  // WiFi module needs ~2s after boot; retry in loop() handles it
+  connectWiFi();
   lastActivity = millis();
   lastFpsCalc = millis();
   eventInfo("System booted");
@@ -1219,10 +1315,17 @@ void setup() {
 // ============================================================
 
 static void pollCameraMotion() {
-  if (!wifiConnected) return;
+  if (!wifiConnected || activeNodeCount == 0) return;
 
-  if (motionClient.connect(ESP32_IP, STREAM_PORT)) {
-    motionClient.print("GET " MOTION_PATH " HTTP/1.0\r\nHost: " ESP32_IP "\r\n\r\n");
+  // Poll each active node
+  for (int n = 0; n < MAX_NODES; n++) {
+    if (!nodes[n].active) continue;
+
+    if (motionClient.connect(nodes[n].ip, STREAM_PORT)) {
+      char req[64];
+      snprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: %s\r\n\r\n",
+               MOTION_PATH, nodes[n].ip.toString().c_str());
+      motionClient.print(req);
 
     unsigned long start = millis();
     while (!motionClient.available() && millis() - start < 500) { delay(1); }
@@ -1241,36 +1344,36 @@ static void pollCameraMotion() {
     motionClient.stop();
 
     // Parse JSON manually (no ArduinoJson dependency — keep it lean)
-    // Looking for: "detected":true/false, "score":XX.X, "count":N
     int detIdx = body.indexOf("\"detected\":");
     if (detIdx >= 0) {
-      bool prevDetected = camMotionDetected;
-      camMotionDetected = body.substring(detIdx + 11, detIdx + 15).startsWith("true");
+      bool prevDetected = nodes[n].motionDetected;
+      nodes[n].motionDetected = body.substring(detIdx + 11, detIdx + 15).startsWith("true");
 
       int scIdx = body.indexOf("\"score\":");
       if (scIdx >= 0) {
         int commaIdx = body.indexOf(',', scIdx + 8);
         if (commaIdx > scIdx) {
-          camMotionScore = body.substring(scIdx + 8, commaIdx).toFloat();
+          nodes[n].motionScore = body.substring(scIdx + 8, commaIdx).toFloat();
         }
       }
 
-      int cntIdx = body.indexOf("\"count\":");
-      if (cntIdx >= 0) {
-        int commaIdx = body.indexOf(',', cntIdx + 8);
-        if (commaIdx > cntIdx) {
-          camMotionCount = body.substring(cntIdx + 8, commaIdx).toInt();
-        }
+      // Update global state (any node motion = global motion)
+      camMotionDetected = false;
+      camMotionScore = 0;
+      for (int k = 0; k < MAX_NODES; k++) {
+        if (nodes[k].active && nodes[k].motionDetected) camMotionDetected = true;
+        if (nodes[k].active && nodes[k].motionScore > camMotionScore) camMotionScore = nodes[k].motionScore;
       }
 
       // Log camera motion events
-      if (camMotionDetected && !prevDetected) {
+      if (nodes[n].motionDetected && !prevDetected) {
         char lb[48];
-        snprintf(lb, sizeof(lb), "Camera motion: %.1f%% pixels changed", camMotionScore);
+        snprintf(lb, sizeof(lb), "Cam %d motion: %.1f%% changed", n, nodes[n].motionScore);
         eventAlert(lb);
       }
     }
-  }
+    } // end if connect
+  } // end for loop
 }
 
 // ============================================================
@@ -1281,25 +1384,17 @@ void loop() {
   unsigned long now = millis();
   lv_timer_handler();
 
-  // WiFi + Stream — only when on dashboard, non-blocking for other pages
+  // Node scan — runs on any page (nodes connect asynchronously)
+  if (wifiConnected && (now - lastNodeScan >= 30000 || lastNodeScan == 0)) {
+    scanForNodes();
+    lastNodeScan = now;
+  }
+
+  // WiFi Stream — only on dashboard
   if (currentPage == PAGE_DASHBOARD) {
-    if (WiFi.status() != WL_CONNECTED) {
-      if (!wifiConnected) {
-        // Start WiFi connect (non-blocking check each loop)
-        static bool wifiStarted = false;
-        if (!wifiStarted) { WiFi.begin(AP_SSID, AP_PASSWORD); wifiStarted = true; }
-        if (WiFi.status() == WL_CONNECTED) {
-          wifiConnected = true; wifiStarted = false;
-          eventInfo("WiFi connected to camera AP");
-          Serial.print("WiFi OK: "); Serial.println(WiFi.localIP());
-        }
-      } else {
-        wifiConnected = false; streamConnected = false;
-        eventWarn("WiFi connection lost");
-        WiFi.begin(AP_SSID, AP_PASSWORD);
-      }
-    } else {
-      wifiConnected = true;
+
+    // Stream from active node
+    if (activeNodeCount > 0) {
       if (!streamConnected) {
         connectStream();
       }
@@ -1310,13 +1405,23 @@ void loop() {
     }
   }
 
+  // WiFi AP retry if not connected
+  static unsigned long lastWiFiRetry = 0;
+  if (!wifiConnected && now - lastWiFiRetry > 5000) {
+    Serial.print("WiFi retry... module status: ");
+    Serial.println(WiFi.status());
+    connectWiFi();
+    lastWiFiRetry = now;
+  }
+
   // FPS calc
   if (now - lastFpsCalc >= 1000) {
     currentFps = frameCount * 1000.0f / (now - lastFpsCalc);
     frameCount = 0; lastFpsCalc = now;
     char lb[80];
-    snprintf(lb, sizeof(lb), "FPS: %.1f | Page: %d | Stream: %s",
-             currentFps, currentPage, streamConnected ? "OK" : "NO");
+    snprintf(lb, sizeof(lb), "FPS: %.1f | Page: %d | Stream: %s | Nodes: %d | WiFi: %s",
+             currentFps, currentPage, streamConnected ? "OK" : "NO",
+             activeNodeCount, wifiConnected ? "AP" : "OFF");
     Serial.println(lb);
   }
 

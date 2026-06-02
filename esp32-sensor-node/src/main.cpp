@@ -1,7 +1,6 @@
-// ESP32-S3 Sense — Wireless Camera Node with Motion Detection + OTA
-// Runs as WiFi AP, serves MJPEG video stream.
-// Frame-differencing motion detection with configurable thresholds.
-// OTA firmware updates via ArduinoOTA (accessible over AP network).
+// ESP32-S3 Sense — Wireless Camera Node (Multi-Node STA Mode)
+// Connects to GIGA R1 AP as a station, serves MJPEG + motion + OTA.
+// NODE_ID set via build flag (-DNODE_ID=0 or -DNODE_ID=1).
 // Board: Seeed Studio XIAO ESP32-S3 Sense
 
 #include <Arduino.h>
@@ -11,6 +10,10 @@
 #include <Update.h>
 #include "esp_camera.h"
 #include "protocol.h"
+
+#ifndef NODE_ID
+  #define NODE_ID 0
+#endif
 
 // Camera pin definitions for XIAO ESP32-S3 Sense
 #define PWDN_GPIO_NUM  -1
@@ -177,7 +180,9 @@ static void runMotionDetection() {
 // ============================================================
 
 void setupOTA() {
-  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  char hostname[32];
+  snprintf(hostname, sizeof(hostname), "%s-%d", OTA_HOSTNAME_PREFIX, NODE_ID);
+  ArduinoOTA.setHostname(hostname);
   ArduinoOTA.setPort(OTA_PORT);
 
   ArduinoOTA.onStart([]() {
@@ -217,7 +222,7 @@ void setupOTA() {
   });
 
   ArduinoOTA.begin();
-  Serial.printf("OTA ready on port %d (hostname: %s)\n", OTA_PORT, OTA_HOSTNAME);
+  Serial.printf("OTA ready on port %d (hostname: %s-%d)\n", OTA_PORT, OTA_HOSTNAME_PREFIX, NODE_ID);
 }
 
 // ============================================================
@@ -310,7 +315,9 @@ void handleMotionConfig() {
 }
 
 void handleOtaStatus() {
-  char json[192];
+  char hostname[32];
+  snprintf(hostname, sizeof(hostname), "%s-%d", OTA_HOSTNAME_PREFIX, NODE_ID);
+  char json[256];
   snprintf(json, sizeof(json),
     "{\"ready\":true,"
     "\"inProgress\":%s,"
@@ -318,13 +325,15 @@ void handleOtaStatus() {
     "\"error\":\"%s\","
     "\"hostname\":\"%s\","
     "\"port\":%d,"
+    "\"nodeId\":%d,"
     "\"freeHeap\":%lu,"
     "\"uptime\":%lu}",
     otaInProgress ? "true" : "false",
     otaProgress,
     otaError.c_str(),
-    OTA_HOSTNAME,
+    hostname,
     OTA_PORT,
+    NODE_ID,
     (unsigned long)ESP.getFreeHeap(),
     millis() / 1000);
 
@@ -376,9 +385,11 @@ void handleOtaUploadDone() {
 
 void handleRoot() {
   String html = "<html><body>"
-                "<h1>GigaSenseHub Camera Node</h1>"
+                "<h1>GigaSenseHub Camera Node " + String(NODE_ID) + "</h1>"
+                "<p>IP: " + WiFi.localIP().toString() + "</p>"
                 "<p><a href=\"" STREAM_PATH "\">MJPEG Stream</a></p>"
                 "<p><a href=\"" MOTION_PATH "\">Motion Status (JSON)</a></p>"
+                "<p><a href=\"" NODE_INFO_PATH "\">Node Info (JSON)</a></p>"
                 "<p><a href=\"" OTA_STATUS_PATH "\">OTA Status (JSON)</a></p>"
                 "<p>Motion: " + String(motionDetected ? "DETECTED" : "clear") +
                 " (" + String(motionScore, 1) + "% changed)</p>"
@@ -391,6 +402,28 @@ void handleRoot() {
   server.send(200, "text/html", html);
 }
 
+void handleNodeInfo() {
+  char json[256];
+  snprintf(json, sizeof(json),
+    "{\"nodeId\":%d,"
+    "\"firmware\":\"%s\","
+    "\"ip\":\"%s\","
+    "\"mac\":\"%s\","
+    "\"rssi\":%d,"
+    "\"freeHeap\":%lu,"
+    "\"uptime\":%lu,"
+    "\"motionEnabled\":%s}",
+    NODE_ID,
+    FW_VERSION,
+    WiFi.localIP().toString().c_str(),
+    WiFi.macAddress().c_str(),
+    WiFi.RSSI(),
+    (unsigned long)ESP.getFreeHeap(),
+    millis() / 1000,
+    motionEnabled ? "true" : "false");
+  server.send(200, "application/json", json);
+}
+
 // ============================================================
 // Setup & Loop
 // ============================================================
@@ -398,8 +431,8 @@ void handleRoot() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n=== GigaSenseHub Camera Node ===");
-  Serial.println("Motion detection: frame differencing (80x60 grayscale)");
+  Serial.printf("\n=== GigaSenseHub Camera Node %d ===\n", NODE_ID);
+  Serial.println("Mode: STA (connecting to GIGA AP)");
   Serial.printf("Firmware: %s (built %s %s)\n", FW_VERSION, __DATE__, __TIME__);
 
   // Allocate motion detection buffers in PSRAM
@@ -411,9 +444,26 @@ void setup() {
   }
   Serial.printf("Motion buffers: %d bytes each in PSRAM\n", DETECT_PIXELS);
 
-  WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL);
-  Serial.print("AP started — IP: ");
-  Serial.println(WiFi.softAPIP());
+  // Connect to GIGA R1 Access Point as station
+  char hostname[32];
+  snprintf(hostname, sizeof(hostname), "%s-%d", OTA_HOSTNAME_PREFIX, NODE_ID);
+  WiFi.setHostname(hostname);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(AP_SSID, AP_PASSWORD);
+  Serial.printf("Connecting to AP '%s'...\n", AP_SSID);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\nWiFi connected — IP: %s (RSSI: %d)\n",
+      WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  } else {
+    Serial.println("\nWiFi connect FAILED — continuing without network");
+  }
 
   initCamera();
   setupOTA();
@@ -422,6 +472,7 @@ void setup() {
   server.on(STREAM_PATH, HTTP_GET, handleStream);
   server.on(MOTION_PATH, HTTP_GET, handleMotion);
   server.on(MOTION_PATH, HTTP_POST, handleMotionConfig);
+  server.on(NODE_INFO_PATH, HTTP_GET, handleNodeInfo);
   server.on(OTA_STATUS_PATH, HTTP_GET, handleOtaStatus);
   server.on(OTA_UPLOAD_PATH, HTTP_POST, handleOtaUploadDone, handleOtaUpload);
   server.begin();
@@ -429,10 +480,18 @@ void setup() {
 }
 
 static unsigned long lastDetect = 0;
+static unsigned long lastReconnect = 0;
 
 void loop() {
   server.handleClient();
   ArduinoOTA.handle();
+
+  // WiFi reconnection (STA mode)
+  if (WiFi.status() != WL_CONNECTED && millis() - lastReconnect > 5000) {
+    Serial.println("WiFi lost — reconnecting...");
+    WiFi.begin(AP_SSID, AP_PASSWORD);
+    lastReconnect = millis();
+  }
 
   // Run motion detection ~4 times per second
   if (millis() - lastDetect >= 250) {
