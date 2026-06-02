@@ -11,6 +11,9 @@
 #include "esp_camera.h"
 #include "esp_sleep.h"
 #include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "protocol.h"
 
 #ifndef NODE_ID
@@ -68,6 +71,17 @@ static unsigned long lastActivityTime = 0;  // Last motion or stream client acti
 static bool     streamClientActive = false; // True while a client is streaming
 static int      wakeReason       = 0;       // esp_sleep_get_wakeup_cause() at boot
 static RTC_DATA_ATTR int bootCount = 0;     // Persists across deep sleep
+
+// ============================================================
+// FreeRTOS Task Handles & Sync
+// ============================================================
+static TaskHandle_t httpTaskHandle     = nullptr;
+static TaskHandle_t motionTaskHandle   = nullptr;
+static TaskHandle_t housekeepTaskHandle = nullptr;
+static SemaphoreHandle_t cameraMutex   = nullptr;  // Guards esp_camera_fb_get
+static volatile uint32_t httpTaskWdog    = 0;  // Watchdog counters
+static volatile uint32_t motionTaskWdog  = 0;
+static volatile uint32_t housekeepWdog   = 0;
 
 // ============================================================
 // Camera Init
@@ -261,7 +275,11 @@ void handleStream() {
       continue;
     }
 
-    camera_fb_t *fb = esp_camera_fb_get();
+    camera_fb_t *fb = nullptr;
+    if (xSemaphoreTake(cameraMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+      fb = esp_camera_fb_get();
+      xSemaphoreGive(cameraMutex);
+    }
     if (!fb) continue;
 
     String part = "--" MJPEG_BOUNDARY "\r\n"
@@ -420,7 +438,7 @@ void handleRoot() {
 void handleNodeInfo() {
   // Any /info request counts as activity (GIGA is scanning us)
   lastActivityTime = millis();
-  char json[384];
+  char json[512];
   const char *pwrStr = powerState == POWER_STATE_LIGHT ? "light" :
                        powerState == POWER_STATE_DEEP  ? "deep" : "active";
   snprintf(json, sizeof(json),
@@ -435,7 +453,8 @@ void handleNodeInfo() {
     "\"motionCount\":%lu,"
     "\"powerState\":\"%s\","
     "\"cpuMhz\":%d,"
-    "\"bootCount\":%d}",
+    "\"bootCount\":%d,"
+    "\"tasks\":{\"http\":%lu,\"motion\":%lu,\"housekeep\":%lu}}",
     NODE_ID,
     FW_VERSION,
     WiFi.localIP().toString().c_str(),
@@ -447,8 +466,93 @@ void handleNodeInfo() {
     (unsigned long)motionCount,
     pwrStr,
     getCpuFrequencyMhz(),
-    bootCount);
+    bootCount,
+    httpTaskWdog, motionTaskWdog, housekeepWdog);
   server.send(200, "application/json", json);
+}
+
+// ============================================================
+// FreeRTOS Tasks
+// ============================================================
+
+// HTTP Server Task — Core 1, Priority 2
+// Handles web requests and ArduinoOTA
+void httpTask(void *param) {
+  (void)param;
+  Serial.println("[httpTask] Started on core " + String(xPortGetCoreID()));
+  for (;;) {
+    server.handleClient();
+    ArduinoOTA.handle();
+    httpTaskWdog++;
+    vTaskDelay(1);  // Yield to other tasks (1 tick = 1ms)
+  }
+}
+
+// Motion Detection Task — Core 0, Priority 1
+// Runs frame differencing at ~4Hz
+void motionTask(void *param) {
+  (void)param;
+  Serial.println("[motionTask] Started on core " + String(xPortGetCoreID()));
+  for (;;) {
+    if (motionEnabled && !otaInProgress && !streamClientActive) {
+      if (xSemaphoreTake(cameraMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        runMotionDetection();
+        xSemaphoreGive(cameraMutex);
+        if (motionDetected) {
+          lastActivityTime = millis();
+          powerState = POWER_STATE_ACTIVE;
+        }
+      }
+    }
+    motionTaskWdog++;
+    vTaskDelay(pdMS_TO_TICKS(250));  // 4Hz
+  }
+}
+
+// Housekeeping Task — Core 0, Priority 1
+// WiFi reconnection + power management state machine
+void housekeepTask(void *param) {
+  (void)param;
+  Serial.println("[housekeepTask] Started on core " + String(xPortGetCoreID()));
+  unsigned long lastReconnect = 0;
+  for (;;) {
+    // WiFi reconnection
+    if (WiFi.status() != WL_CONNECTED && millis() - lastReconnect > 5000) {
+      Serial.println("WiFi lost — reconnecting...");
+      WiFi.begin(AP_SSID, AP_PASSWORD);
+      lastReconnect = millis();
+    }
+
+    // Power management state machine
+    unsigned long idle = millis() - lastActivityTime;
+
+    if (powerState == POWER_STATE_ACTIVE) {
+      if (!streamClientActive && idle >= IDLE_DEEP_SLEEP_MS && !otaInProgress) {
+        Serial.printf("Deep sleep: idle %lums\n", idle);
+        Serial.flush();
+        esp_sleep_enable_timer_wakeup(DEEP_SLEEP_WAKE_US);
+        esp_deep_sleep_start();
+      }
+      else if (!streamClientActive && idle >= IDLE_LIGHT_SLEEP_MS && !otaInProgress) {
+        if (powerState != POWER_STATE_LIGHT) {
+          Serial.printf("Light sleep mode: idle %lums\n", idle);
+          powerState = POWER_STATE_LIGHT;
+          setCpuFrequencyMhz(80);
+        }
+      }
+    }
+    else if (powerState == POWER_STATE_LIGHT) {
+      if (motionDetected || streamClientActive) {
+        Serial.println("Waking from light sleep");
+        powerState = POWER_STATE_ACTIVE;
+        setCpuFrequencyMhz(240);
+        lastActivityTime = millis();
+      }
+    }
+
+    housekeepWdog++;
+    vTaskDelay(pdMS_TO_TICKS(1000));  // 1Hz
+  }
 }
 
 // ============================================================
@@ -511,62 +615,33 @@ void setup() {
   lastActivityTime = millis();
   powerState = POWER_STATE_ACTIVE;
   Serial.printf("Boot #%d | Wake reason: %d\n", bootCount, wakeReason);
+
+  // Create camera mutex (stream and motion both use camera)
+  cameraMutex = xSemaphoreCreateMutex();
+
+  // Spawn FreeRTOS tasks
+  //   httpTask:      Core 1, prio 2, 8KB stack (handles stream + OTA)
+  //   motionTask:    Core 0, prio 1, 8KB stack (JPEG decode needs RAM)
+  //   housekeepTask: Core 0, prio 1, 4KB stack (WiFi + power mgmt)
+  xTaskCreatePinnedToCore(httpTask,      "http",      8192, nullptr, 2, &httpTaskHandle,      1);
+  xTaskCreatePinnedToCore(motionTask,    "motion",    8192, nullptr, 1, &motionTaskHandle,    0);
+  xTaskCreatePinnedToCore(housekeepTask, "housekeep", 4096, nullptr, 1, &housekeepTaskHandle, 0);
+
+  Serial.println("FreeRTOS tasks spawned: http(C1) motion(C0) housekeep(C0)");
 }
 
-static unsigned long lastDetect = 0;
-static unsigned long lastReconnect = 0;
+static unsigned long lastWdogPrint = 0;
 
 void loop() {
-  server.handleClient();
-  ArduinoOTA.handle();
-
-  // WiFi reconnection (STA mode)
-  if (WiFi.status() != WL_CONNECTED && millis() - lastReconnect > 5000) {
-    Serial.println("WiFi lost — reconnecting...");
-    WiFi.begin(AP_SSID, AP_PASSWORD);
-    lastReconnect = millis();
+  // Main loop is now a watchdog monitor — all work is in FreeRTOS tasks
+  if (millis() - lastWdogPrint >= 10000) {
+    Serial.printf("[watchdog] http=%lu motion=%lu housekeep=%lu | heap=%lu\n",
+      httpTaskWdog, motionTaskWdog, housekeepWdog,
+      (unsigned long)ESP.getFreeHeap());
+    httpTaskWdog = 0;
+    motionTaskWdog = 0;
+    housekeepWdog = 0;
+    lastWdogPrint = millis();
   }
-
-  // Run motion detection ~4 times per second
-  if (millis() - lastDetect >= 250) {
-    lastDetect = millis();
-    runMotionDetection();
-    // Motion resets idle timer
-    if (motionDetected) {
-      lastActivityTime = millis();
-      powerState = POWER_STATE_ACTIVE;
-    }
-  }
-
-  // Power management state machine
-  unsigned long idle = millis() - lastActivityTime;
-
-  if (powerState == POWER_STATE_ACTIVE) {
-    if (!streamClientActive && idle >= IDLE_DEEP_SLEEP_MS && !otaInProgress) {
-      // No stream, no motion for 5 min → deep sleep
-      Serial.printf("Deep sleep: idle %lums, wake in %ds\n", idle, DEEP_SLEEP_WAKE_US / 1000000);
-      Serial.flush();
-      esp_sleep_enable_timer_wakeup(DEEP_SLEEP_WAKE_US);
-      esp_deep_sleep_start();
-      // Never reaches here — deep sleep resets the CPU
-    }
-    else if (!streamClientActive && idle >= IDLE_LIGHT_SLEEP_MS && !otaInProgress) {
-      // No stream, no motion for 60s → light sleep (WiFi stays)
-      if (powerState != POWER_STATE_LIGHT) {
-        Serial.printf("Light sleep mode: idle %lums\n", idle);
-        powerState = POWER_STATE_LIGHT;
-        // Reduce CPU frequency to save power
-        setCpuFrequencyMhz(80);  // Down from 240MHz
-      }
-    }
-  }
-  else if (powerState == POWER_STATE_LIGHT) {
-    // Wake from light sleep on activity
-    if (motionDetected || streamClientActive) {
-      Serial.println("Waking from light sleep — activity detected");
-      powerState = POWER_STATE_ACTIVE;
-      setCpuFrequencyMhz(240);  // Restore full speed
-      lastActivityTime = millis();
-    }
-  }
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }
