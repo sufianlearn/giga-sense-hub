@@ -70,10 +70,28 @@ jobs:
           path: giga-display-hub/.pio/build/giga_r1_wifi/firmware.bin
           retention-days: 30
 
+  test-native:
+    name: Unit Tests (Native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Run native tests
+        run: pio test -e native --filter test_native -v
+        working-directory: esp32-sensor-node
+
   build-report:
     name: Build Size Report
     runs-on: ubuntu-latest
-    needs: [build-esp32, build-giga]
+    needs: [build-esp32, build-giga, test-native]
     steps:
       - uses: actions/checkout@v4
 
