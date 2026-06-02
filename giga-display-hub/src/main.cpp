@@ -13,10 +13,35 @@
 #include "tjpgd.h"
 #include "storage.h"
 #include "eventlog.h"
+#include "mbedtls/md.h"
 
 Arduino_H7_Video display(800, 480, GigaDisplayShield);
 Arduino_GigaDisplayTouch touchCtrl;
 BoschSensorClass myIMU(Wire1);
+
+// ============================================================
+// HMAC-SHA256 — sign outgoing requests to ESP32 nodes
+// ============================================================
+static uint32_t hmacNonce = 0;
+
+// Generate HMAC-SHA256 hex string: HMAC(key, "nonce:path")
+static void gigaHmacSign(const char *path, char *outHex, char *outNonce) {
+  uint32_t n = hmacNonce++;
+  snprintf(outNonce, 16, "%lu", (unsigned long)n);
+  char msg[80];
+  snprintf(msg, sizeof(msg), "%s:%s", outNonce, path);
+
+  uint8_t hash[32];
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
+  mbedtls_md_hmac_starts(&ctx, (const unsigned char *)HMAC_SECRET_KEY, strlen(HMAC_SECRET_KEY));
+  mbedtls_md_hmac_update(&ctx, (const unsigned char *)msg, strlen(msg));
+  mbedtls_md_hmac_finish(&ctx, hash);
+  mbedtls_md_free(&ctx);
+  for (int i = 0; i < 32; i++) sprintf(outHex + i * 2, "%02x", hash[i]);
+  outHex[64] = '\0';
+}
 
 // ============================================================
 // Theme Colors
@@ -1113,8 +1138,14 @@ void scanForNodes() {
     IPAddress ip(192, 168, 3, 2 + i);
     probe.stop();
     if (probe.connect(ip, STREAM_PORT)) {
+      // Sign request with HMAC
+      char hmac[65], nonce[16];
+      gigaHmacSign(NODE_INFO_PATH, hmac, nonce);
       probe.print("GET " NODE_INFO_PATH " HTTP/1.0\r\nHost: ");
-      probe.print(ip); probe.print("\r\n\r\n");
+      probe.print(ip);
+      probe.print("\r\n" AUTH_HEADER ": "); probe.print(hmac);
+      probe.print("\r\n" AUTH_NONCE_HEADER ": "); probe.print(nonce);
+      probe.print("\r\n\r\n");
       unsigned long t = millis();
       while (!probe.available() && millis() - t < 800) delay(5);
       // Read response
@@ -1177,9 +1208,19 @@ bool connectStream() {
     Serial.println("Stream connect failed!");
     return false;
   }
-  char req[128];
-  snprintf(req, sizeof(req), "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive\r\n\r\n",
-           STREAM_PATH, node.ip.toString().c_str());
+  char hmac[65], nonce[16];
+  gigaHmacSign(STREAM_PATH, hmac, nonce);
+  char req[256];
+  snprintf(req, sizeof(req),
+    "GET %s HTTP/1.1\r\n"
+    "Host: %s\r\n"
+    "Connection: keep-alive\r\n"
+    "%s: %s\r\n"
+    "%s: %s\r\n"
+    "\r\n",
+    STREAM_PATH, node.ip.toString().c_str(),
+    AUTH_HEADER, hmac,
+    AUTH_NONCE_HEADER, nonce);
   streamClient.print(req);
   unsigned long t = millis() + 5000;
   while (millis() < t) {
