@@ -46,6 +46,7 @@ AppPage currentPage = PAGE_LOGIN;
 
 // WiFi / Stream
 WiFiClient streamClient;
+WiFiClient motionClient;
 bool streamConnected = false;
 bool wifiConnected = false;
 unsigned long lastFpsCalc = 0;
@@ -101,6 +102,7 @@ static lv_obj_t *ledDoor[3];
 static lv_obj_t *ledWin[3];
 static lv_obj_t *lblWin[3];
 static lv_obj_t *lblAccel, *lblGyro, *lblMotion, *lblUptime;
+static lv_obj_t *lblCamMotion;  // Camera-based motion from ESP32
 static lv_obj_t *lblStatusBar;
 
 // Settings page
@@ -117,6 +119,12 @@ static lv_obj_t *taNewPin;
 // Activity Log page
 static lv_obj_t *logList = nullptr;
 static lv_obj_t *lblLogCount;
+
+// Camera motion detection state (polled from ESP32)
+static bool     camMotionDetected = false;
+static float    camMotionScore    = 0.0f;
+static uint32_t camMotionCount    = 0;
+static unsigned long lastCamPoll  = 0;
 
 // ============================================================
 // JPEG Decoder
@@ -571,6 +579,8 @@ void buildDashboardPage() {
   lv_obj_set_style_text_color(lblGyro, C_TEXT_DIM, 0);
   lblMotion = lv_label_create(sc); lv_label_set_text(lblMotion, "Motion: --");
   lv_obj_set_style_text_color(lblMotion, C_GREEN, 0);
+  lblCamMotion = lv_label_create(sc); lv_label_set_text(lblCamMotion, "Camera: --");
+  lv_obj_set_style_text_color(lblCamMotion, C_TEXT_DIM, 0);
   lblUptime = lv_label_create(sc); lv_label_set_text(lblUptime, "Uptime: 0s");
   lv_obj_set_style_text_color(lblUptime, C_TEXT_DIM, 0);
 
@@ -1100,6 +1110,22 @@ void updateDashboardUI() {
   lv_label_set_text(lblMotion, motion);
   lv_obj_set_style_text_color(lblMotion, mc, 0);
 
+  // Camera motion (from ESP32 frame differencing)
+  if (wifiConnected && lastCamPoll > 0) {
+    if (camMotionDetected) {
+      snprintf(buf, sizeof(buf), "Camera: MOTION (%.1f%% / %lu)", camMotionScore, (unsigned long)camMotionCount);
+      lv_label_set_text(lblCamMotion, buf);
+      lv_obj_set_style_text_color(lblCamMotion, C_RED, 0);
+    } else {
+      snprintf(buf, sizeof(buf), "Camera: Clear (%.1f%% / %lu)", camMotionScore, (unsigned long)camMotionCount);
+      lv_label_set_text(lblCamMotion, buf);
+      lv_obj_set_style_text_color(lblCamMotion, C_GREEN, 0);
+    }
+  } else {
+    lv_label_set_text(lblCamMotion, "Camera: No WiFi");
+    lv_obj_set_style_text_color(lblCamMotion, C_TEXT_DIM, 0);
+  }
+
   unsigned long secs = millis() / 1000;
   snprintf(buf, sizeof(buf), "Uptime: %lum %lus", secs / 60, secs % 60);
   lv_label_set_text(lblUptime, buf);
@@ -1189,6 +1215,65 @@ void setup() {
 }
 
 // ============================================================
+// Camera Motion Polling (HTTP GET /motion from ESP32)
+// ============================================================
+
+static void pollCameraMotion() {
+  if (!wifiConnected) return;
+
+  if (motionClient.connect(ESP32_IP, STREAM_PORT)) {
+    motionClient.print("GET " MOTION_PATH " HTTP/1.0\r\nHost: " ESP32_IP "\r\n\r\n");
+
+    unsigned long start = millis();
+    while (!motionClient.available() && millis() - start < 500) { delay(1); }
+
+    // Skip HTTP headers
+    bool bodyReached = false;
+    String body = "";
+    while (motionClient.available()) {
+      String line = motionClient.readStringUntil('\n');
+      if (bodyReached) {
+        body += line;
+      } else if (line == "\r" || line.length() == 0) {
+        bodyReached = true;
+      }
+    }
+    motionClient.stop();
+
+    // Parse JSON manually (no ArduinoJson dependency — keep it lean)
+    // Looking for: "detected":true/false, "score":XX.X, "count":N
+    int detIdx = body.indexOf("\"detected\":");
+    if (detIdx >= 0) {
+      bool prevDetected = camMotionDetected;
+      camMotionDetected = body.substring(detIdx + 11, detIdx + 15).startsWith("true");
+
+      int scIdx = body.indexOf("\"score\":");
+      if (scIdx >= 0) {
+        int commaIdx = body.indexOf(',', scIdx + 8);
+        if (commaIdx > scIdx) {
+          camMotionScore = body.substring(scIdx + 8, commaIdx).toFloat();
+        }
+      }
+
+      int cntIdx = body.indexOf("\"count\":");
+      if (cntIdx >= 0) {
+        int commaIdx = body.indexOf(',', cntIdx + 8);
+        if (commaIdx > cntIdx) {
+          camMotionCount = body.substring(cntIdx + 8, commaIdx).toInt();
+        }
+      }
+
+      // Log camera motion events
+      if (camMotionDetected && !prevDetected) {
+        char lb[48];
+        snprintf(lb, sizeof(lb), "Camera motion: %.1f%% pixels changed", camMotionScore);
+        eventAlert(lb);
+      }
+    }
+  }
+}
+
+// ============================================================
 // Main Loop
 // ============================================================
 
@@ -1242,6 +1327,12 @@ void loop() {
     if (imu.accelerationAvailable()) imu.readAcceleration(accelX, accelY, accelZ);
     if (imu.gyroscopeAvailable()) imu.readGyroscope(gyroX, gyroY, gyroZ);
     lastIMU = now;
+  }
+
+  // Poll camera motion endpoint (~every 2 seconds)
+  if (now - lastCamPoll >= 2000 && currentPage == PAGE_DASHBOARD) {
+    pollCameraMotion();
+    lastCamPoll = now;
   }
 
   // UI updates
