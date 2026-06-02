@@ -71,7 +71,7 @@ AppPage currentPage = PAGE_LOGIN;
 #define settings storageSettings()
 
 // WiFi / Stream
-// Global streamClient removed — each CameraNode has its own .streamClient
+WiFiClient streamClient;   // Global stream client for single-view mode
 WiFiClient motionClient;
 bool streamConnected = false;
 bool wifiConnected = false;
@@ -508,8 +508,7 @@ static void mkWinRow(lv_obj_t *p, int idx) {
 static void switchCamCb(lv_event_t *e) {
   (void)e;
   // Disconnect current stream
-  nodes[activeNodeIdx].streamClient.stop();
-  nodes[activeNodeIdx].streamConnected = false;
+  streamClient.stop();
   streamConnected = false;
   // Find next active node (wrap around)
   int start = activeNodeIdx;
@@ -534,36 +533,31 @@ static void toggleGridCb(lv_event_t *e) {
   (void)e;
   gridMode = !gridMode;
   if (gridMode) {
+    // Entering grid: stop global single-view stream
+    streamClient.stop();
+    streamConnected = false;
     // Show both images side-by-side using LVGL zoom
     lv_label_set_text(lblGrid, LV_SYMBOL_IMAGE "  Single");
     lv_label_set_text(lblCamTitle, LV_SYMBOL_VIDEO "  Grid View");
-    // Scale both images to 50% (128 = half of 256 normal scale)
     if (camImg)  lv_image_set_scale(camImg, 128);
     if (camImg1) {
       lv_obj_clear_flag(camImg1, LV_OBJ_FLAG_HIDDEN);
       lv_image_set_scale(camImg1, 128);
     }
-    // Disconnect current single stream — main loop will connect both
+  } else {
+    // Exiting grid: stop per-node streams
     for (int i = 0; i < MAX_NODES; i++) {
       nodes[i].streamClient.stop();
       nodes[i].streamConnected = false;
     }
     streamConnected = false;
-  } else {
     // Single-cam mode: full size, hide second image
     lv_label_set_text(lblGrid, LV_SYMBOL_IMAGE "  Grid");
     char buf[32];
     snprintf(buf, sizeof(buf), LV_SYMBOL_VIDEO "  Cam %d", activeNodeIdx);
     lv_label_set_text(lblCamTitle, buf);
-    // Restore full scale for single cam
     if (camImg)  lv_image_set_scale(camImg, 256);
     if (camImg1) lv_obj_add_flag(camImg1, LV_OBJ_FLAG_HIDDEN);
-    // Disconnect all streams, let main loop reconnect to activeNodeIdx
-    for (int i = 0; i < MAX_NODES; i++) {
-      nodes[i].streamClient.stop();
-      nodes[i].streamConnected = false;
-    }
-    streamConnected = false;
   }
   Serial.print("Grid mode: "); Serial.println(gridMode ? "ON" : "OFF");
 }
@@ -1332,22 +1326,81 @@ bool connectNodeStream(int idx) {
   node.streamClient.stop(); return false;
 }
 
-// Legacy wrapper for single-cam mode
+// Single-view: uses global streamClient (proven working path)
 bool connectStream() {
-  streamConnected = false;
   if (activeNodeCount == 0) return false;
-  bool ok = connectNodeStream(activeNodeIdx);
-  if (ok) streamConnected = true;
-  return ok;
+  if (streamClient.connected()) return true;
+  CameraNode &node = nodes[activeNodeIdx];
+  if (!node.active) return false;
+  Serial.print("Connecting stream to node "); Serial.print(activeNodeIdx);
+  Serial.print(" at "); Serial.println(node.ip);
+  if (!streamClient.connect(node.ip, STREAM_PORT)) {
+    Serial.println("Stream connect failed!");
+    return false;
+  }
+  char hmac[65], nonce[16];
+  gigaHmacSign(STREAM_PATH, hmac, nonce);
+  char req[256];
+  snprintf(req, sizeof(req),
+    "GET %s HTTP/1.1\r\n"
+    "Host: %s\r\n"
+    "Connection: keep-alive\r\n"
+    "%s: %s\r\n"
+    "%s: %s\r\n"
+    "\r\n",
+    STREAM_PATH, node.ip.toString().c_str(),
+    AUTH_HEADER, hmac,
+    AUTH_NONCE_HEADER, nonce);
+  streamClient.print(req);
+  unsigned long t = millis() + 5000;
+  while (millis() < t) {
+    if (streamClient.available()) {
+      if (streamClient.readStringUntil('\n').startsWith("--" MJPEG_BOUNDARY)) {
+        streamConnected = true;
+        Serial.print("Stream connected to node "); Serial.println(activeNodeIdx);
+        return true;
+      }
+    }
+  }
+  streamClient.stop(); return false;
 }
 
+bool readFrame() {
+  if (!streamClient.connected()) { streamConnected = false; return false; }
+  int clen = -1;
+  unsigned long t = millis() + 3000;
+  while (millis() < t) {
+    if (!streamClient.available()) { delay(1); continue; }
+    String l = streamClient.readStringUntil('\n'); l.trim();
+    if (l.length() == 0) break;
+    if (l.startsWith("Content-Length:")) clen = l.substring(15).toInt();
+  }
+  if (clen <= 0 || clen > JPEG_BUF_SIZE) return false;
+  int rd = 0; t = millis() + 3000;
+  while (rd < clen && millis() < t) {
+    if (streamClient.available()) {
+      int g = streamClient.read(jpegBuf + rd, min((int)streamClient.available(), clen - rd));
+      if (g > 0) rd += g;
+    } else delay(1);
+  }
+  if (rd != clen) return false;
+  jpegLen = clen;
+  t = millis() + 1000;
+  while (millis() < t) {
+    if (streamClient.available()) {
+      String l = streamClient.readStringUntil('\n'); l.trim();
+      if (l.startsWith("--" MJPEG_BOUNDARY)) break;
+    } else delay(1);
+  }
+  return true;
+}
+
+// Grid mode: read from a specific node's per-node streamClient
 bool readNodeFrame(int idx) {
   CameraNode &node = nodes[idx];
   if (!node.streamClient.connected()) { node.streamConnected = false; return false; }
   int clen = -1;
-  // Use shorter timeouts in grid mode to keep both streams responsive
-  unsigned long timeout = gridMode ? 500 : 3000;
-  unsigned long t = millis() + timeout;
+  unsigned long t = millis() + 500;  // Short timeout for grid responsiveness
   while (millis() < t) {
     if (!node.streamClient.available()) { delay(1); continue; }
     String l = node.streamClient.readStringUntil('\n'); l.trim();
@@ -1355,7 +1408,7 @@ bool readNodeFrame(int idx) {
     if (l.startsWith("Content-Length:")) clen = l.substring(15).toInt();
   }
   if (clen <= 0 || clen > JPEG_BUF_SIZE) return false;
-  int rd = 0; t = millis() + timeout;
+  int rd = 0; t = millis() + 500;
   while (rd < clen && millis() < t) {
     if (node.streamClient.available()) {
       int g = node.streamClient.read(jpegBuf + rd, min((int)node.streamClient.available(), clen - rd));
@@ -1372,11 +1425,6 @@ bool readNodeFrame(int idx) {
     } else delay(1);
   }
   return true;
-}
-
-// Legacy wrapper
-bool readFrame() {
-  return readNodeFrame(activeNodeIdx);
 }
 
 // ============================================================
