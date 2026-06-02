@@ -103,6 +103,7 @@ static lv_obj_t *ledWin[3];
 static lv_obj_t *lblWin[3];
 static lv_obj_t *lblAccel, *lblGyro, *lblMotion, *lblUptime;
 static lv_obj_t *lblCamMotion;  // Camera-based motion from ESP32
+static lv_obj_t *lblCamTitle;   // Camera card title (shows active cam)
 static lv_obj_t *lblStatusBar;
 
 // Settings page
@@ -465,6 +466,29 @@ static void mkWinRow(lv_obj_t *p, int idx) {
   lv_obj_set_style_text_color(lblWin[idx], C_GREEN, 0);
 }
 
+// Switch camera feed to next active node
+static void switchCamCb(lv_event_t *e) {
+  (void)e;
+  // Disconnect current stream
+  streamClient.stop();
+  streamConnected = false;
+  // Find next active node (wrap around)
+  int start = activeNodeIdx;
+  for (int i = 1; i <= MAX_NODES; i++) {
+    int next = (start + i) % MAX_NODES;
+    if (nodes[next].active) {
+      activeNodeIdx = next;
+      break;
+    }
+  }
+  // Update title
+  char buf[32];
+  snprintf(buf, sizeof(buf), LV_SYMBOL_VIDEO "  Cam %d", activeNodeIdx);
+  lv_label_set_text(lblCamTitle, buf);
+  Serial.print("Switched to camera node "); Serial.println(activeNodeIdx);
+  eventInfo("Camera switched");
+}
+
 void buildDashboardPage() {
   scrDashboard = lv_obj_create(nullptr);
   lv_obj_set_style_bg_color(scrDashboard, C_BG, 0);
@@ -557,10 +581,29 @@ void buildDashboardPage() {
   lv_obj_set_style_pad_gap(cc, 4, 0);
 
   lv_obj_t *ch = mkRow(cc, 18);
-  mkTitle(ch, LV_SYMBOL_VIDEO "  Camera 1");
+  lblCamTitle = lv_label_create(ch);
+  lv_label_set_text(lblCamTitle, LV_SYMBOL_VIDEO "  Cam 0");
+  lv_obj_set_style_text_color(lblCamTitle, C_TEXT, 0);
   lblFps = lv_label_create(ch);
   lv_label_set_text(lblFps, "-- fps");
   lv_obj_set_style_text_color(lblFps, C_GREEN, 0);
+
+  // Camera switch button
+  lv_obj_t *btnSwitch = lv_obj_create(ch);
+  lv_obj_set_size(btnSwitch, 50, 18);
+  lv_obj_set_style_bg_color(btnSwitch, C_PIN_BTN, 0);
+  lv_obj_set_style_bg_color(btnSwitch, C_PIN_BTN_PR, LV_STATE_PRESSED);
+  lv_obj_set_style_bg_opa(btnSwitch, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(btnSwitch, 4, 0);
+  lv_obj_set_style_border_width(btnSwitch, 0, 0);
+  lv_obj_set_style_pad_all(btnSwitch, 0, 0);
+  lv_obj_clear_flag(btnSwitch, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(btnSwitch, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_t *swLbl = lv_label_create(btnSwitch);
+  lv_label_set_text(swLbl, LV_SYMBOL_REFRESH);
+  lv_obj_set_style_text_color(swLbl, C_TEXT_DIM, 0);
+  lv_obj_center(swLbl);
+  lv_obj_add_event_cb(btnSwitch, switchCamCb, LV_EVENT_CLICKED, nullptr);
 
   // Video image
   camFrameBuf = (uint16_t *)SDRAM.malloc(CAM_W * CAM_H * sizeof(uint16_t));
@@ -1182,12 +1225,16 @@ void updateDashboardUI() {
   snprintf(buf, sizeof(buf), "%.1f fps", currentFps);
   lv_label_set_text(lblFps, buf);
 
+  // Camera title with active node
+  snprintf(buf, sizeof(buf), LV_SYMBOL_VIDEO "  Cam %d", activeNodeIdx);
+  lv_label_set_text(lblCamTitle, buf);
+
   lv_label_set_text(lblStreamStatus, streamConnected ? LV_SYMBOL_PLAY " LIVE" : "Offline");
   lv_obj_set_style_text_color(lblStreamStatus, streamConnected ? C_GREEN : C_RED, 0);
 
   if (wifiConnected) {
-    snprintf(buf, sizeof(buf), LV_SYMBOL_WIFI " AP %s | %d nodes | %s",
-             GIGA_AP_IP, activeNodeCount,
+    snprintf(buf, sizeof(buf), LV_SYMBOL_WIFI " AP | %d cam%s | %s",
+             activeNodeCount, activeNodeCount != 1 ? "s" : "",
              streamConnected ? "LIVE" : "NO STREAM");
     lv_label_set_text(lblStatusBar, buf);
     lv_obj_set_style_text_color(lblStatusBar, activeNodeCount > 0 ? C_GREEN : C_ORANGE, 0);
