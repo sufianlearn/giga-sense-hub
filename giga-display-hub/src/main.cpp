@@ -59,6 +59,7 @@ static void gigaHmacSign(const char *path, char *outHex, char *outNonce) {
 #define C_BORDER      lv_color_hex(0x30363D)
 #define C_PIN_BTN     lv_color_hex(0x21262D)
 #define C_PIN_BTN_PR  lv_color_hex(0x30363D)
+#define C_CYAN        lv_color_hex(0x56D4DD)
 
 // ============================================================
 // App State
@@ -94,6 +95,15 @@ const char *windowNames[3] = {"Living Room", "Bedroom", "Kitchen"};
 
 // Auto-lock
 unsigned long lastActivity = 0;
+
+// Radar Vitals (received from host via Serial)
+bool radarPresence = false;
+float radarBreathBPM = 0, radarBreathConf = 0;
+float radarHeartBPM = 0, radarHeartConf = 0;
+float radarDistM = 0, radarMag = 0;
+unsigned long lastRadarUpdate = 0;
+static char serialBuf[128];
+static int serialBufPos = 0;
 
 // JPEG
 #define JPEG_BUF_SIZE (32 * 1024)
@@ -139,6 +149,8 @@ static lv_obj_t *lblAccel, *lblGyro, *lblMag, *lblMotion, *lblUptime;
 static lv_obj_t *lblCamMotion;  // Camera-based motion from ESP32
 static lv_obj_t *lblCamTitle;   // Camera card title (shows active cam)
 static lv_obj_t *lblStatusBar;
+// Radar Vitals UI
+static lv_obj_t *lblRadarPresence, *lblRadarBreath, *lblRadarHeart, *lblRadarDist;
 
 // Settings page
 static lv_obj_t *lblSettingsWifi;
@@ -181,7 +193,7 @@ static unsigned long lastNodeScan = 0;
 // ============================================================
 // JPEG Decoder
 // ============================================================
-struct JpegSession { const uint8_t *data; int len; int pos; uint16_t *targetBuf; };
+struct JpegSession { const uint8_t *data; int len; int pos; };
 
 static unsigned int tjpg_input(JDEC *jd, uint8_t *buf, unsigned int n) {
   JpegSession *s = (JpegSession *)jd->device;
@@ -194,14 +206,12 @@ static unsigned int tjpg_input(JDEC *jd, uint8_t *buf, unsigned int n) {
 
 static int tjpg_output(JDEC *jd, void *bmp, JRECT *r) {
   uint16_t *px = (uint16_t *)bmp;
-  JpegSession *s = (JpegSession *)jd->device;
-  uint16_t *fb = s->targetBuf;
-  if (!fb) return 0;
+  if (!camFrameBuf) return 0;
   for (int y = r->top; y <= r->bottom; y++)
     for (int x = r->left; x <= r->right; x++) {
       if ((unsigned)x < CAM_W && (unsigned)y < CAM_H) {
         uint16_t c = *px;
-        fb[y * CAM_W + x] = (c >> 8) | (c << 8);
+        camFrameBuf[y * CAM_W + x] = (c >> 8) | (c << 8);
       }
       px++;
     }
@@ -213,14 +223,14 @@ static int tjpg_output(JDEC *jd, void *bmp, JRECT *r) {
 #endif
 static uint8_t tjWork[TJPGD_WORKSPACE_SIZE];
 
-void decodeFrame(uint16_t *fb, lv_image_dsc_t *dsc, lv_obj_t *img) {
-  JpegSession sess = {jpegBuf, jpegLen, 0, fb};
+void decodeFrame() {
+  JpegSession sess = {jpegBuf, jpegLen, 0};
   JDEC jd;
   if (jd_prepare(&jd, tjpg_input, tjWork, TJPGD_WORKSPACE_SIZE, &sess) == JDR_OK) {
     jd_decomp(&jd, tjpg_output, 0);
-    if (img) {
-      lv_image_set_src(img, dsc);
-      lv_obj_invalidate(img);
+    if (camImg) {
+      lv_image_set_src(camImg, &camImgDsc);
+      lv_obj_invalidate(camImg);
     }
   }
 }
@@ -536,14 +546,11 @@ static void toggleGridCb(lv_event_t *e) {
     // Entering grid: stop global single-view stream
     streamClient.stop();
     streamConnected = false;
-    // Show both images side-by-side using LVGL zoom
     lv_label_set_text(lblGrid, LV_SYMBOL_IMAGE "  Single");
     lv_label_set_text(lblCamTitle, LV_SYMBOL_VIDEO "  Grid View");
-    if (camImg)  lv_image_set_scale(camImg, 128);
-    if (camImg1) {
-      lv_obj_clear_flag(camImg1, LV_OBJ_FLAG_HIDDEN);
-      lv_image_set_scale(camImg1, 128);
-    }
+    // Hide single image, show grid row
+    if (camImg) lv_obj_add_flag(camImg, LV_OBJ_FLAG_HIDDEN);
+    if (camRow) lv_obj_clear_flag(camRow, LV_OBJ_FLAG_HIDDEN);
   } else {
     // Exiting grid: stop per-node streams
     for (int i = 0; i < MAX_NODES; i++) {
@@ -551,13 +558,13 @@ static void toggleGridCb(lv_event_t *e) {
       nodes[i].streamConnected = false;
     }
     streamConnected = false;
-    // Single-cam mode: full size, hide second image
     lv_label_set_text(lblGrid, LV_SYMBOL_IMAGE "  Grid");
     char buf[32];
     snprintf(buf, sizeof(buf), LV_SYMBOL_VIDEO "  Cam %d", activeNodeIdx);
     lv_label_set_text(lblCamTitle, buf);
-    if (camImg)  lv_image_set_scale(camImg, 256);
-    if (camImg1) lv_obj_add_flag(camImg1, LV_OBJ_FLAG_HIDDEN);
+    // Show single image, hide grid row
+    if (camImg) lv_obj_clear_flag(camImg, LV_OBJ_FLAG_HIDDEN);
+    if (camRow) lv_obj_add_flag(camRow, LV_OBJ_FLAG_HIDDEN);
   }
   Serial.print("Grid mode: "); Serial.println(gridMode ? "ON" : "OFF");
 }
@@ -695,7 +702,7 @@ void buildDashboardPage() {
   lv_obj_center(lblGrid);
   lv_obj_add_event_cb(btnGrid, toggleGridCb, LV_EVENT_CLICKED, nullptr);
 
-  // Camera image row container (for grid layout)
+  // Camera image row container (for grid layout — hidden until needed)
   camRow = lv_obj_create(cc);
   lv_obj_set_size(camRow, 350, LV_SIZE_CONTENT);
   lv_obj_set_style_bg_opa(camRow, LV_OPA_TRANSP, 0);
@@ -704,8 +711,9 @@ void buildDashboardPage() {
   lv_obj_set_style_pad_column(camRow, 6, 0);
   lv_obj_set_flex_flow(camRow, LV_FLEX_FLOW_ROW);
   lv_obj_clear_flag(camRow, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(camRow, LV_OBJ_FLAG_HIDDEN);  // Hidden until grid mode
 
-  // Video image — cam 0 / single view
+  // Video image — single view (direct child of cc, NOT camRow)
   camFrameBuf = (uint16_t *)SDRAM.malloc(CAM_W * CAM_H * sizeof(uint16_t));
   if (camFrameBuf) {
     memset(camFrameBuf, 0, CAM_W * CAM_H * sizeof(uint16_t));
@@ -716,13 +724,11 @@ void buildDashboardPage() {
     camImgDsc.data_size = CAM_W * CAM_H * 2;
     camImgDsc.data = (const uint8_t *)camFrameBuf;
 
-    camImg = lv_image_create(camRow);
+    camImg = lv_image_create(cc);
     lv_image_set_src(camImg, &camImgDsc);
-    lv_obj_set_style_radius(camImg, 4, 0);
-    lv_obj_set_style_clip_corner(camImg, true, 0);
   }
 
-  // Video image — cam 1 (grid view, hidden by default)
+  // Video image — cam 1 (grid view only, inside camRow)
   camFrameBuf1 = (uint16_t *)SDRAM.malloc(CAM_W * CAM_H * sizeof(uint16_t));
   if (camFrameBuf1) {
     memset(camFrameBuf1, 0, CAM_W * CAM_H * sizeof(uint16_t));
@@ -735,9 +741,6 @@ void buildDashboardPage() {
 
     camImg1 = lv_image_create(camRow);
     lv_image_set_src(camImg1, &camImgDsc1);
-    lv_obj_set_style_radius(camImg1, 4, 0);
-    lv_obj_set_style_clip_corner(camImg1, true, 0);
-    lv_obj_add_flag(camImg1, LV_OBJ_FLAG_HIDDEN);  // Hidden until grid mode
   }
 
   lblStreamStatus = lv_label_create(cc);
@@ -782,20 +785,24 @@ void buildDashboardPage() {
   mkTitle(wc, LV_SYMBOL_WARNING "  Window Sensors");
   for (int i = 0; i < 3; i++) mkWinRow(wc, i);
 
-  // System card
-  lv_obj_t *sysc = mkCard(scrDashboard, 412, 92);
-  lv_obj_set_pos(sysc, 382, 390);
-  lv_obj_set_flex_flow(sysc, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_style_pad_gap(sysc, 4, 0);
-  mkTitle(sysc, LV_SYMBOL_SETTINGS "  System");
-  lv_obj_t *ar = mkRow(sysc, 26);
-  lv_obj_set_style_pad_column(ar, 8, 0);
-  lv_obj_set_flex_align(ar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  lv_obj_t *al = lv_led_create(ar);
-  lv_led_set_color(al, C_GREEN); lv_led_set_brightness(al, 200); lv_obj_set_size(al, 10, 10);
-  lv_obj_t *at = lv_label_create(ar);
-  lv_label_set_text(at, "System Armed - All Active");
-  lv_obj_set_style_text_color(at, C_GREEN, 0);
+  // Radar Vitals card (60GHz contactless vital signs)
+  lv_obj_t *rc = mkCard(scrDashboard, 412, 92);
+  lv_obj_set_pos(rc, 382, 390);
+  lv_obj_set_flex_flow(rc, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_gap(rc, 2, 0);
+  mkTitle(rc, LV_SYMBOL_EYE_OPEN "  Radar Vitals (60GHz)");
+  lblRadarPresence = lv_label_create(rc);
+  lv_label_set_text(lblRadarPresence, "Presence: --");
+  lv_obj_set_style_text_color(lblRadarPresence, C_TEXT_DIM, 0);
+  lblRadarBreath = lv_label_create(rc);
+  lv_label_set_text(lblRadarBreath, "Breathing: -- BPM");
+  lv_obj_set_style_text_color(lblRadarBreath, C_CYAN, 0);
+  lblRadarHeart = lv_label_create(rc);
+  lv_label_set_text(lblRadarHeart, "Heart: -- BPM");
+  lv_obj_set_style_text_color(lblRadarHeart, lv_color_hex(0xFF5555), 0);
+  lblRadarDist = lv_label_create(rc);
+  lv_label_set_text(lblRadarDist, "Dist: --  Sig: --");
+  lv_obj_set_style_text_color(lblRadarDist, C_TEXT_DIM, 0);
 }
 
 // ============================================================
@@ -1431,6 +1438,41 @@ bool readNodeFrame(int idx) {
 // UI Update (Dashboard)
 // ============================================================
 
+// Parse [RV] line from host (radar_vitals.py)
+// Format: [RV] <presence> <breath_bpm> <breath_conf> <heart_bpm> <heart_conf> <dist_m> <mag>
+void parseRadarVitalsLine(const char *line) {
+  int pres;
+  float bb, bc, hb, hc, dm, mg;
+  if (sscanf(line, "[RV] %d %f %f %f %f %f %f", &pres, &bb, &bc, &hb, &hc, &dm, &mg) == 7) {
+    radarPresence = (pres != 0);
+    radarBreathBPM = bb;
+    radarBreathConf = bc;
+    radarHeartBPM = hb;
+    radarHeartConf = hc;
+    radarDistM = dm;
+    radarMag = mg;
+    lastRadarUpdate = millis();
+  }
+}
+
+// Read incoming serial data (non-blocking, line buffered)
+void readSerialRadarData() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (serialBufPos > 0) {
+        serialBuf[serialBufPos] = '\0';
+        if (strncmp(serialBuf, "[RV]", 4) == 0) {
+          parseRadarVitalsLine(serialBuf);
+        }
+        serialBufPos = 0;
+      }
+    } else if (serialBufPos < (int)sizeof(serialBuf) - 1) {
+      serialBuf[serialBufPos++] = c;
+    }
+  }
+}
+
 void updateDashboardUI() {
   if (currentPage != PAGE_DASHBOARD) return;
   char buf[64];
@@ -1518,6 +1560,30 @@ void updateDashboardUI() {
     lv_led_set_color(ledWin[i], windowOpen[i] ? C_ORANGE : C_GREEN);
     lv_label_set_text(lblWin[i], windowOpen[i] ? "OPEN" : "CLOSED");
     lv_obj_set_style_text_color(lblWin[i], windowOpen[i] ? C_ORANGE : C_GREEN, 0);
+  }
+
+  // Radar Vitals
+  unsigned long now = millis();
+  bool radarStale = (lastRadarUpdate == 0 || now - lastRadarUpdate > 5000);
+  if (radarStale) {
+    lv_label_set_text(lblRadarPresence, "Presence: No data");
+    lv_obj_set_style_text_color(lblRadarPresence, C_TEXT_DIM, 0);
+    lv_label_set_text(lblRadarBreath, "Breathing: -- BPM");
+    lv_label_set_text(lblRadarHeart, "Heart: -- BPM");
+    lv_label_set_text(lblRadarDist, "Dist: --  Sig: --");
+  } else {
+    snprintf(buf, sizeof(buf), "Presence: %s", radarPresence ? "DETECTED" : "Clear");
+    lv_label_set_text(lblRadarPresence, buf);
+    lv_obj_set_style_text_color(lblRadarPresence, radarPresence ? C_GREEN : C_TEXT_DIM, 0);
+
+    snprintf(buf, sizeof(buf), "Breathing: %.0f BPM (%.0f%%)", radarBreathBPM, radarBreathConf * 100);
+    lv_label_set_text(lblRadarBreath, buf);
+
+    snprintf(buf, sizeof(buf), "Heart: %.0f BPM (%.0f%%)", radarHeartBPM, radarHeartConf * 100);
+    lv_label_set_text(lblRadarHeart, buf);
+
+    snprintf(buf, sizeof(buf), "Dist: %.1fm  Sig: %.1f", radarDistM, radarMag);
+    lv_label_set_text(lblRadarDist, buf);
   }
 }
 
@@ -1699,10 +1765,7 @@ void loop() {
         // Non-blocking check: only read if data is available
         if (!nodes[idx].streamClient.available()) continue;
         if (readNodeFrame(idx)) {
-          uint16_t *fb = (idx == 0) ? camFrameBuf : camFrameBuf1;
-          lv_image_dsc_t *dsc = (idx == 0) ? &camImgDsc : &camImgDsc1;
-          lv_obj_t *img = (idx == 0) ? camImg : camImg1;
-          if (fb) decodeFrame(fb, dsc, img);
+          decodeFrame();
           frameCount++;
         }
       }
@@ -1714,7 +1777,7 @@ void loop() {
           connectStream();
         }
         if (streamConnected && readFrame()) {
-          if (camFrameBuf) decodeFrame(camFrameBuf, &camImgDsc, camImg);
+          if (camFrameBuf) decodeFrame();
           frameCount++;
         }
       }
@@ -1758,6 +1821,9 @@ void loop() {
     pollCameraMotion();
     lastCamPoll = now;
   }
+
+  // Read radar vitals from host serial (non-blocking)
+  readSerialRadarData();
 
   // UI updates
   static unsigned long lastUI = 0;
