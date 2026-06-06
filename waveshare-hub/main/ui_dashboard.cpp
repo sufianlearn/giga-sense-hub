@@ -1,0 +1,236 @@
+/**
+ * @file ui_dashboard.cpp
+ * @brief Dashboard with dual camera live view + weather panel + status bar.
+ *        Layout: 800x480
+ *        ┌────────────────────────────────────────────────────┐
+ *        │ Status Bar (30px)                                  │
+ *        ├──────────────┬──────────────┬──────────────────────┤
+ *        │  Cam 0       │  Cam 1       │  Weather Panel       │
+ *        │  (320x240)   │  (320x240)   │  (160x420)           │
+ *        │              │              │  Temperature         │
+ *        │              │              │  Description         │
+ *        │              │              │  Wind Speed          │
+ *        │              │              │  City                │
+ *        ├──────────────┴──────────────┤  Settings btn        │
+ *        │  FPS + Node Info            │                      │
+ *        └──────────────────────────────┴──────────────────────┘
+ */
+#include "ui_dashboard.h"
+#include "stream_client.h"
+#include "weather.h"
+#include "definitions.h"
+#include "esp_log.h"
+#include <stdio.h>
+
+static lv_obj_t *scr_dash = NULL;
+
+/* Camera image widgets */
+static lv_obj_t *cam_img[2]  = {NULL, NULL};
+static lv_img_dsc_t cam_dsc[2];
+
+/* Status bar */
+static lv_obj_t *lbl_status  = NULL;
+
+/* Weather panel */
+static lv_obj_t *lbl_temp    = NULL;
+static lv_obj_t *lbl_desc    = NULL;
+static lv_obj_t *lbl_wind    = NULL;
+static lv_obj_t *lbl_city    = NULL;
+static lv_obj_t *lbl_weather_icon = NULL;
+
+/* FPS */
+static lv_obj_t *lbl_fps     = NULL;
+
+/* Forward declare */
+extern "C" void app_switch_to_settings(void);
+
+static void settings_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    app_switch_to_settings();
+}
+
+lv_obj_t *ui_dashboard_create(void)
+{
+    scr_dash = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_dash, lv_color_hex(0x0f0f23), 0);
+    lv_obj_clear_flag(scr_dash, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* ── Status Bar ─────────────────────────────────────────── */
+    lv_obj_t *bar = lv_obj_create(scr_dash);
+    lv_obj_set_size(bar, 800, 32);
+    lv_obj_align(bar, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_border_width(bar, 0, 0);
+    lv_obj_set_style_radius(bar, 0, 0);
+    lv_obj_set_style_pad_all(bar, 4, 0);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+
+    lbl_status = lv_label_create(bar);
+    lv_label_set_text(lbl_status, LV_SYMBOL_WIFI "  GigaSenseHub  |  Nodes: 0  |  WiFi: AP");
+    lv_obj_set_style_text_color(lbl_status, lv_color_hex(0x00d4ff), 0);
+    lv_obj_align(lbl_status, LV_ALIGN_LEFT_MID, 4, 0);
+
+    /* ── Camera 0 ───────────────────────────────────────────── */
+    /* Card container */
+    lv_obj_t *cam0_card = lv_obj_create(scr_dash);
+    lv_obj_set_size(cam0_card, 314, 260);
+    lv_obj_set_pos(cam0_card, 4, 36);
+    lv_obj_set_style_bg_color(cam0_card, lv_color_hex(0x1a1a2e), 0);
+    lv_obj_set_style_border_color(cam0_card, lv_color_hex(0x00d4ff), 0);
+    lv_obj_set_style_border_width(cam0_card, 1, 0);
+    lv_obj_set_style_radius(cam0_card, 8, 0);
+    lv_obj_set_style_pad_all(cam0_card, 2, 0);
+    lv_obj_clear_flag(cam0_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *cam0_lbl = lv_label_create(cam0_card);
+    lv_label_set_text(cam0_lbl, LV_SYMBOL_VIDEO " Cam 0");
+    lv_obj_set_style_text_color(cam0_lbl, lv_color_hex(0x00d4ff), 0);
+    lv_obj_align(cam0_lbl, LV_ALIGN_TOP_LEFT, 2, 0);
+
+    cam_dsc[0].header.always_zero = 0;
+    cam_dsc[0].header.w = CAM_FRAME_W;
+    cam_dsc[0].header.h = CAM_FRAME_H;
+    cam_dsc[0].header.cf = LV_IMG_CF_TRUE_COLOR;
+    cam_dsc[0].data_size = CAM_FRAME_W * CAM_FRAME_H * 2;
+    cam_dsc[0].data = NULL;
+
+    cam_img[0] = lv_img_create(scr_dash);
+    lv_obj_set_pos(cam_img[0], 8, 56);
+    lv_img_set_zoom(cam_img[0], (310 * 256) / CAM_FRAME_W);  /* Scale to ~310px wide */
+
+    /* ── Camera 1 ───────────────────────────────────────────── */
+    lv_obj_t *cam1_card = lv_obj_create(scr_dash);
+    lv_obj_set_size(cam1_card, 314, 260);
+    lv_obj_set_pos(cam1_card, 322, 36);
+    lv_obj_set_style_bg_color(cam1_card, lv_color_hex(0x1a1a2e), 0);
+    lv_obj_set_style_border_color(cam1_card, lv_color_hex(0x00d4ff), 0);
+    lv_obj_set_style_border_width(cam1_card, 1, 0);
+    lv_obj_set_style_radius(cam1_card, 8, 0);
+    lv_obj_set_style_pad_all(cam1_card, 2, 0);
+    lv_obj_clear_flag(cam1_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *cam1_lbl = lv_label_create(cam1_card);
+    lv_label_set_text(cam1_lbl, LV_SYMBOL_VIDEO " Cam 1");
+    lv_obj_set_style_text_color(cam1_lbl, lv_color_hex(0x00d4ff), 0);
+    lv_obj_align(cam1_lbl, LV_ALIGN_TOP_LEFT, 2, 0);
+
+    cam_dsc[1].header.always_zero = 0;
+    cam_dsc[1].header.w = CAM_FRAME_W;
+    cam_dsc[1].header.h = CAM_FRAME_H;
+    cam_dsc[1].header.cf = LV_IMG_CF_TRUE_COLOR;
+    cam_dsc[1].data_size = CAM_FRAME_W * CAM_FRAME_H * 2;
+    cam_dsc[1].data = NULL;
+
+    cam_img[1] = lv_img_create(scr_dash);
+    lv_obj_set_pos(cam_img[1], 326, 56);
+    lv_img_set_zoom(cam_img[1], (310 * 256) / CAM_FRAME_W);
+
+    /* ── FPS / Info bar ─────────────────────────────────────── */
+    lbl_fps = lv_label_create(scr_dash);
+    lv_label_set_text(lbl_fps, "FPS: -- | --");
+    lv_obj_set_style_text_color(lbl_fps, lv_color_hex(0x888888), 0);
+    lv_obj_set_pos(lbl_fps, 10, 300);
+
+    /* ── Weather Panel (right side) ─────────────────────────── */
+    lv_obj_t *weather_card = lv_obj_create(scr_dash);
+    lv_obj_set_size(weather_card, 156, 440);
+    lv_obj_set_pos(weather_card, 640, 36);
+    lv_obj_set_style_bg_color(weather_card, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_border_color(weather_card, lv_color_hex(0x0e4d92), 0);
+    lv_obj_set_style_border_width(weather_card, 1, 0);
+    lv_obj_set_style_radius(weather_card, 8, 0);
+    lv_obj_set_style_pad_all(weather_card, 10, 0);
+    lv_obj_clear_flag(weather_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *weather_title = lv_label_create(weather_card);
+    lv_label_set_text(weather_title, LV_SYMBOL_CHARGE " Weather");
+    lv_obj_set_style_text_color(weather_title, lv_color_hex(0x00d4ff), 0);
+    lv_obj_set_style_text_font(weather_title, &lv_font_montserrat_16, 0);
+    lv_obj_align(weather_title, LV_ALIGN_TOP_MID, 0, 0);
+
+    lbl_city = lv_label_create(weather_card);
+    lv_label_set_text(lbl_city, WEATHER_CITY);
+    lv_obj_set_style_text_color(lbl_city, lv_color_hex(0xaaaaaa), 0);
+    lv_obj_align(lbl_city, LV_ALIGN_TOP_MID, 0, 25);
+    lv_label_set_long_mode(lbl_city, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl_city, 136);
+    lv_obj_set_style_text_align(lbl_city, LV_TEXT_ALIGN_CENTER, 0);
+
+    lbl_weather_icon = lv_label_create(weather_card);
+    lv_label_set_text(lbl_weather_icon, LV_SYMBOL_CHARGE);
+    lv_obj_set_style_text_color(lbl_weather_icon, lv_color_hex(0xFFD700), 0);
+    lv_obj_set_style_text_font(lbl_weather_icon, &lv_font_montserrat_28, 0);
+    lv_obj_align(lbl_weather_icon, LV_ALIGN_TOP_MID, 0, 60);
+
+    lbl_temp = lv_label_create(weather_card);
+    lv_label_set_text(lbl_temp, "--.-°C");
+    lv_obj_set_style_text_color(lbl_temp, lv_color_white(), 0);
+    lv_obj_set_style_text_font(lbl_temp, &lv_font_montserrat_28, 0);
+    lv_obj_align(lbl_temp, LV_ALIGN_TOP_MID, 0, 100);
+
+    lbl_desc = lv_label_create(weather_card);
+    lv_label_set_text(lbl_desc, "Loading...");
+    lv_obj_set_style_text_color(lbl_desc, lv_color_hex(0xcccccc), 0);
+    lv_obj_align(lbl_desc, LV_ALIGN_TOP_MID, 0, 140);
+    lv_label_set_long_mode(lbl_desc, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl_desc, 136);
+    lv_obj_set_style_text_align(lbl_desc, LV_TEXT_ALIGN_CENTER, 0);
+
+    lbl_wind = lv_label_create(weather_card);
+    lv_label_set_text(lbl_wind, "Wind: -- km/h");
+    lv_obj_set_style_text_color(lbl_wind, lv_color_hex(0xaaaaaa), 0);
+    lv_obj_align(lbl_wind, LV_ALIGN_TOP_MID, 0, 180);
+
+    /* ── Settings Button ────────────────────────────────────── */
+    lv_obj_t *btn_settings = lv_btn_create(weather_card);
+    lv_obj_set_size(btn_settings, 130, 40);
+    lv_obj_align(btn_settings, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(btn_settings, lv_color_hex(0x0e4d92), 0);
+    lv_obj_add_event_cb(btn_settings, settings_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *btn_lbl = lv_label_create(btn_settings);
+    lv_label_set_text(btn_lbl, LV_SYMBOL_SETTINGS " Settings");
+    lv_obj_set_style_text_color(btn_lbl, lv_color_white(), 0);
+    lv_obj_center(btn_lbl);
+
+    return scr_dash;
+}
+
+void ui_dashboard_update_cam(int node_idx, uint16_t *rgb_data, int w, int h)
+{
+    if (node_idx < 0 || node_idx >= 2 || !cam_img[node_idx]) return;
+    cam_dsc[node_idx].data = (const uint8_t *)rgb_data;
+    cam_dsc[node_idx].header.w = w;
+    cam_dsc[node_idx].header.h = h;
+    lv_img_set_src(cam_img[node_idx], &cam_dsc[node_idx]);
+}
+
+void ui_dashboard_update_weather(void)
+{
+    if (!g_weather.valid) return;
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.1f°C", g_weather.temperature);
+    lv_label_set_text(lbl_temp, buf);
+
+    lv_label_set_text(lbl_desc, g_weather.description);
+
+    snprintf(buf, sizeof(buf), "Wind: %.0f km/h", g_weather.wind_speed);
+    lv_label_set_text(lbl_wind, buf);
+
+    lv_label_set_text(lbl_weather_icon, weather_code_to_icon(g_weather.weather_code));
+}
+
+void ui_dashboard_update_status(void)
+{
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             LV_SYMBOL_WIFI "  GigaSenseHub  |  Nodes: %d  |  N0:%s N1:%s  |  WiFi: AP",
+             g_active_node_count,
+             g_nodes[0].active ? "ON" : "--",
+             g_nodes[1].active ? "ON" : "--");
+    lv_label_set_text(lbl_status, buf);
+    lv_obj_set_style_text_color(lbl_status,
+        g_active_node_count > 0 ? lv_color_hex(0x00ff88) : lv_color_hex(0xff8800), 0);
+}
