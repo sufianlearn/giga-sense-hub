@@ -44,6 +44,33 @@ static lv_obj_t *lbl_fps     = NULL;
 /* Forward declare */
 extern "C" void app_switch_to_settings(void);
 
+static void no_scroll(lv_obj_t *obj)
+{
+    if (!obj) return;
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLL_MOMENTUM);
+    lv_obj_set_scroll_dir(obj, LV_DIR_NONE);
+    lv_obj_set_scrollbar_mode(obj, LV_SCROLLBAR_MODE_OFF);
+}
+
+static void opaque_label(lv_obj_t *lbl, uint32_t bg)
+{
+    if (!lbl) return;
+    lv_obj_set_style_bg_color(lbl, lv_color_hex(bg), 0);
+    lv_obj_set_style_bg_opa(lbl, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_left(lbl, 2, 0);
+    lv_obj_set_style_pad_right(lbl, 2, 0);
+    no_scroll(lbl);
+}
+
+static void invalidate_dashboard(void)
+{
+    if (scr_dash) lv_obj_invalidate(scr_dash);
+}
+
 static void settings_btn_cb(lv_event_t *e)
 {
     (void)e;
@@ -53,41 +80,47 @@ static void settings_btn_cb(lv_event_t *e)
 lv_obj_t *ui_dashboard_create(void)
 {
     scr_dash = lv_obj_create(NULL);
+    lv_obj_set_size(scr_dash, LCD_H_RES, LCD_V_RES);
     lv_obj_set_style_bg_color(scr_dash, lv_color_hex(0x0f0f23), 0);
-    lv_obj_clear_flag(scr_dash, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_scroll_dir(scr_dash, LV_DIR_NONE);
+    lv_obj_set_style_bg_opa(scr_dash, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(scr_dash, 0, 0);
+    no_scroll(scr_dash);
 
     /* ── Status Bar ─────────────────────────────────────────── */
     lv_obj_t *bar = lv_obj_create(scr_dash);
-    lv_obj_set_size(bar, 800, 32);
-    lv_obj_align(bar, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_size(bar, 784, 32);
+    lv_obj_align(bar, LV_ALIGN_TOP_LEFT, 8, 0);
     lv_obj_set_style_bg_color(bar, lv_color_hex(0x16213e), 0);
     lv_obj_set_style_border_width(bar, 0, 0);
     lv_obj_set_style_radius(bar, 0, 0);
     lv_obj_set_style_pad_all(bar, 4, 0);
-    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+    no_scroll(bar);
 
     lbl_status = lv_label_create(bar);
     lv_label_set_text(lbl_status, LV_SYMBOL_WIFI "  GigaSenseHub  |  Nodes: 0  |  WiFi: AP");
     lv_obj_set_style_text_color(lbl_status, lv_color_hex(0x00d4ff), 0);
-    lv_obj_align(lbl_status, LV_ALIGN_LEFT_MID, 4, 0);
+    lv_obj_set_width(lbl_status, 760);
+    lv_label_set_long_mode(lbl_status, LV_LABEL_LONG_CLIP);
+    opaque_label(lbl_status, 0x16213e);
+    lv_obj_align(lbl_status, LV_ALIGN_LEFT_MID, 8, 0);
 
     /* ── Camera 0 ───────────────────────────────────────────── */
     /* Card container */
     lv_obj_t *cam0_card = lv_obj_create(scr_dash);
     lv_obj_set_size(cam0_card, 314, 260);
-    lv_obj_set_pos(cam0_card, 4, 36);
+    lv_obj_set_pos(cam0_card, 8, 36);
     lv_obj_set_style_bg_color(cam0_card, lv_color_hex(0x1a1a2e), 0);
     lv_obj_set_style_border_color(cam0_card, lv_color_hex(0x00d4ff), 0);
     lv_obj_set_style_border_width(cam0_card, 1, 0);
-    lv_obj_set_style_radius(cam0_card, 8, 0);
+    lv_obj_set_style_radius(cam0_card, 0, 0);
     lv_obj_set_style_pad_all(cam0_card, 2, 0);
-    lv_obj_clear_flag(cam0_card, LV_OBJ_FLAG_SCROLLABLE);
+    no_scroll(cam0_card);
 
     lv_obj_t *cam0_lbl = lv_label_create(cam0_card);
     lv_label_set_text(cam0_lbl, LV_SYMBOL_VIDEO " Cam 0");
     lv_obj_set_style_text_color(cam0_lbl, lv_color_hex(0x00d4ff), 0);
     lv_obj_align(cam0_lbl, LV_ALIGN_TOP_LEFT, 2, 0);
+    no_scroll(cam0_lbl);
 
     cam_dsc[0].header.always_zero = 0;
     cam_dsc[0].header.w = CAM_FRAME_W;
@@ -97,24 +130,26 @@ lv_obj_t *ui_dashboard_create(void)
     cam_dsc[0].data = NULL;
 
     cam_img[0] = lv_img_create(scr_dash);
-    lv_obj_set_pos(cam_img[0], 8, 56);
+    lv_obj_set_pos(cam_img[0], 12, 56);
     lv_img_set_zoom(cam_img[0], (310 * 256) / CAM_FRAME_W);  /* Scale to ~310px wide */
+    no_scroll(cam_img[0]);
 
     /* ── Camera 1 ───────────────────────────────────────────── */
     lv_obj_t *cam1_card = lv_obj_create(scr_dash);
     lv_obj_set_size(cam1_card, 314, 260);
-    lv_obj_set_pos(cam1_card, 322, 36);
+    lv_obj_set_pos(cam1_card, 326, 36);
     lv_obj_set_style_bg_color(cam1_card, lv_color_hex(0x1a1a2e), 0);
     lv_obj_set_style_border_color(cam1_card, lv_color_hex(0x00d4ff), 0);
     lv_obj_set_style_border_width(cam1_card, 1, 0);
-    lv_obj_set_style_radius(cam1_card, 8, 0);
+    lv_obj_set_style_radius(cam1_card, 0, 0);
     lv_obj_set_style_pad_all(cam1_card, 2, 0);
-    lv_obj_clear_flag(cam1_card, LV_OBJ_FLAG_SCROLLABLE);
+    no_scroll(cam1_card);
 
     lv_obj_t *cam1_lbl = lv_label_create(cam1_card);
     lv_label_set_text(cam1_lbl, LV_SYMBOL_VIDEO " Cam 1");
     lv_obj_set_style_text_color(cam1_lbl, lv_color_hex(0x00d4ff), 0);
     lv_obj_align(cam1_lbl, LV_ALIGN_TOP_LEFT, 2, 0);
+    no_scroll(cam1_lbl);
 
     cam_dsc[1].header.always_zero = 0;
     cam_dsc[1].header.w = CAM_FRAME_W;
@@ -124,14 +159,18 @@ lv_obj_t *ui_dashboard_create(void)
     cam_dsc[1].data = NULL;
 
     cam_img[1] = lv_img_create(scr_dash);
-    lv_obj_set_pos(cam_img[1], 326, 56);
+    lv_obj_set_pos(cam_img[1], 330, 56);
     lv_img_set_zoom(cam_img[1], (310 * 256) / CAM_FRAME_W);
+    no_scroll(cam_img[1]);
 
     /* ── FPS / Info bar ─────────────────────────────────────── */
     lbl_fps = lv_label_create(scr_dash);
     lv_label_set_text(lbl_fps, "FPS: -- | --");
     lv_obj_set_style_text_color(lbl_fps, lv_color_hex(0x888888), 0);
-    lv_obj_set_pos(lbl_fps, 10, 300);
+    lv_obj_set_width(lbl_fps, 620);
+    lv_label_set_long_mode(lbl_fps, LV_LABEL_LONG_CLIP);
+    opaque_label(lbl_fps, 0x0f0f23);
+    lv_obj_set_pos(lbl_fps, 12, 300);
 
     /* ── Weather Panel (right side) ─────────────────────────── */
     lv_obj_t *weather_card = lv_obj_create(scr_dash);
@@ -140,9 +179,9 @@ lv_obj_t *ui_dashboard_create(void)
     lv_obj_set_style_bg_color(weather_card, lv_color_hex(0x16213e), 0);
     lv_obj_set_style_border_color(weather_card, lv_color_hex(0x0e4d92), 0);
     lv_obj_set_style_border_width(weather_card, 1, 0);
-    lv_obj_set_style_radius(weather_card, 8, 0);
+    lv_obj_set_style_radius(weather_card, 0, 0);
     lv_obj_set_style_pad_all(weather_card, 10, 0);
-    lv_obj_clear_flag(weather_card, LV_OBJ_FLAG_SCROLLABLE);
+    no_scroll(weather_card);
 
     lv_obj_t *weather_title = lv_label_create(weather_card);
     lv_label_set_text(weather_title, LV_SYMBOL_CHARGE " Weather");
@@ -205,6 +244,7 @@ void ui_dashboard_update_cam(int node_idx, uint16_t *rgb_data, int w, int h)
     cam_dsc[node_idx].header.w = w;
     cam_dsc[node_idx].header.h = h;
     lv_img_set_src(cam_img[node_idx], &cam_dsc[node_idx]);
+    invalidate_dashboard();
 }
 
 void ui_dashboard_update_weather(void)
@@ -221,6 +261,7 @@ void ui_dashboard_update_weather(void)
     lv_label_set_text(lbl_wind, buf);
 
     lv_label_set_text(lbl_weather_icon, weather_code_to_icon(g_weather.weather_code));
+    invalidate_dashboard();
 }
 
 void ui_dashboard_update_status(void)
@@ -234,4 +275,5 @@ void ui_dashboard_update_status(void)
     lv_label_set_text(lbl_status, buf);
     lv_obj_set_style_text_color(lbl_status,
         g_active_node_count > 0 ? lv_color_hex(0x00ff88) : lv_color_hex(0xff8800), 0);
+    invalidate_dashboard();
 }

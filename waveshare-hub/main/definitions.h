@@ -3,7 +3,6 @@
 /* ── Display geometry ──────────────────────────────────────────────── */
 #define LCD_H_RES               800
 #define LCD_V_RES               480
-/* Lower RGB PCLK to reduce ESP32-S3 RGB DMA/PSRAM contention ghost-scroll. */
 #define LCD_PIXEL_CLOCK_HZ      (12 * 1000 * 1000)
 #define LCD_NUM_FB              2
 

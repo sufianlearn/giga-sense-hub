@@ -47,6 +47,7 @@ extern "C" void app_switch_to_dashboard(void)
     if (lvgl_port_lock(-1)) {
         if (!scr_dashboard) scr_dashboard = ui_dashboard_create();
         lv_scr_load(scr_dashboard);
+        lv_obj_invalidate(lv_scr_act());
         lvgl_port_unlock();
     }
 

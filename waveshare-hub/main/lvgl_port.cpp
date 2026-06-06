@@ -31,33 +31,18 @@ SemaphoreHandle_t lvgl_mux = NULL;
 
 static lv_disp_draw_buf_t s_disp_buf;
 static lv_disp_drv_t      s_disp_drv;
-static SemaphoreHandle_t  s_vsync_sem = NULL;
-
-static bool rgb_vsync_cb(esp_lcd_panel_handle_t, const esp_lcd_rgb_panel_event_data_t *, void *)
-{
-    BaseType_t hp_task_woken = pdFALSE;
-    if (s_vsync_sem) {
-        xSemaphoreGiveFromISR(s_vsync_sem, &hp_task_woken);
-    }
-    return hp_task_woken == pdTRUE;
-}
 
 static void lvgl_tick_inc_cb(void *)
 {
     lv_tick_inc(LVGL_TICK_PERIOD_MS);
 }
 
+/* Plain flush — exact logic_suite path: no VSYNC pacing, no bounce buffer. */
 static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
                            lv_color_t *color_map)
 {
     esp_lcd_panel_handle_t panel =
         static_cast<esp_lcd_panel_handle_t>(drv->user_data);
-
-    /* DMA clue: pace the PSRAM framebuffer write to RGB VSYNC so LVGL's
-       copy does not race the RGB DMA scanout. */
-    if (s_vsync_sem) {
-        xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(20));
-    }
 
     esp_lcd_panel_draw_bitmap(panel,
                                area->x1, area->y1,
@@ -153,16 +138,16 @@ void lvgl_port_init(void)
                 .vsync_idle_low  = true,
                 .de_idle_high    = true,
                 .pclk_active_neg = true,
-                .pclk_idle_high  = true,
             },
         },
         .data_width       = 16,
         .bits_per_pixel   = 0,
         .num_fbs          = LCD_NUM_FB,
-        /* Small internal bounce buffer decouples RGB DMA from PSRAM scanout.
-           Keep it tiny: 2 lines avoids the previous SRAM-pressure dark screen. */
-        .bounce_buffer_size_px = LCD_H_RES * 2,
-        .sram_trans_align = 0,
+        /* 10-line bounce buffer: large enough to avoid left-edge tearing from
+           too-frequent DMA restarts.  fb_size % (2 * bb_size) == 0 verified:
+           768000 % (2 * 16000) == 0.  Decouples PSRAM scanout from RGB DMA. */
+        .bounce_buffer_size_px = LCD_H_RES * 10,
+        .sram_trans_align = 4,
         .psram_trans_align = 64,
         .hsync_gpio_num   = PIN_NUM_HSYNC,
         .vsync_gpio_num   = PIN_NUM_VSYNC,
@@ -185,18 +170,11 @@ void lvgl_port_init(void)
             .fb_in_psram       = true,
             .double_fb         = (LCD_NUM_FB == 2),
             .no_fb             = false,
-            .bb_invalidate_cache = false,
+            .bb_invalidate_cache = true,
         },
     };
 
     ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_cfg, &panel_handle));
-
-    s_vsync_sem = xSemaphoreCreateBinary();
-    assert(s_vsync_sem && "VSYNC semaphore creation failed");
-    const esp_lcd_rgb_panel_event_callbacks_t cbs = {
-        .on_vsync = rgb_vsync_cb,
-    };
-    ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(panel_handle, &cbs, NULL));
 
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
@@ -260,19 +238,14 @@ void lvgl_port_init(void)
     ESP_LOGI(TAG, "Initialize touch controller GT911");
     ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_gt911(tp_io_handle, &tp_cfg, &tp));
 
-    /* LVGL init — DMA-safe draw buffers. Keep LVGL's temporary draw buffers
-       in internal DMA RAM so rendering does not hammer PSRAM while RGB DMA
-       scans the PSRAM framebuffers. */
+    /* LVGL draw buffer: single PSRAM buffer, 100 lines — exact logic_suite path */
     lv_init();
 
-    constexpr size_t LVGL_BUF_LINES = 10;
-    constexpr size_t LVGL_BUF_PIXELS = LCD_H_RES * LVGL_BUF_LINES;
     void *buf1 = heap_caps_malloc(
-        LVGL_BUF_PIXELS * sizeof(lv_color_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-    void *buf2 = heap_caps_malloc(
-        LVGL_BUF_PIXELS * sizeof(lv_color_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-    assert(buf1 && buf2 && "Internal DMA LVGL draw buffers allocation failed");
-    lv_disp_draw_buf_init(&s_disp_buf, buf1, buf2, LVGL_BUF_PIXELS);
+        LCD_H_RES * 100 * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    assert(buf1 && "LVGL draw buffer allocation failed");
+    lv_disp_draw_buf_init(&s_disp_buf, buf1, NULL,
+                           LCD_H_RES * 100);
 
     lv_disp_drv_init(&s_disp_drv);
     s_disp_drv.hor_res    = LCD_H_RES;
@@ -280,8 +253,6 @@ void lvgl_port_init(void)
     s_disp_drv.flush_cb   = lvgl_flush_cb;
     s_disp_drv.draw_buf   = &s_disp_buf;
     s_disp_drv.user_data  = panel_handle;
-    s_disp_drv.full_refresh = 0;
-    s_disp_drv.direct_mode  = 0;
     lv_disp_t *disp = lv_disp_drv_register(&s_disp_drv);
 
     static lv_indev_drv_t indev_drv;
