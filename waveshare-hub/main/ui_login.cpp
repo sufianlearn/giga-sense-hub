@@ -75,7 +75,7 @@ static void clear_btn_cb(lv_event_t *e)
 
 static lv_obj_t *make_btn(lv_obj_t *parent, const char *txt, int x, int y, lv_event_cb_t cb, const char *userdata)
 {
-    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_t *btn = lv_button_create(parent);
     lv_obj_set_size(btn, 90, 56);
     lv_obj_set_pos(btn, x, y);
     lv_obj_set_style_bg_color(btn, lv_color_hex(0x16213e), 0);

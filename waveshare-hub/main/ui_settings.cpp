@@ -26,9 +26,9 @@ static void back_btn_cb(lv_event_t *e)
    Only go to dashboard when the back button is at the root page. */
 static void menu_back_cb(lv_event_t *e)
 {
-    lv_obj_t *menu = lv_event_get_target(e);
-    lv_obj_t *back_btn = lv_menu_get_main_header_back_btn(menu);
-    if (lv_menu_back_btn_is_root(menu, back_btn)) {
+    lv_obj_t *menu = (lv_obj_t *)lv_event_get_target(e);
+    lv_obj_t *back_btn = lv_menu_get_main_header_back_button(menu);
+    if (lv_menu_back_button_is_root(menu, back_btn)) {
         app_switch_to_dashboard();
     }
 }
@@ -57,7 +57,7 @@ lv_obj_t *ui_settings_create(void)
     lv_obj_set_style_pad_all(top_bar, 4, 0);
     lv_obj_clear_flag(top_bar, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *back_btn = lv_btn_create(top_bar);
+    lv_obj_t *back_btn = lv_button_create(top_bar);
     lv_obj_set_size(back_btn, 100, 34);
     lv_obj_align(back_btn, LV_ALIGN_LEFT_MID, 0, 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x1a1a2e), 0);
@@ -183,7 +183,7 @@ lv_obj_t *ui_settings_create(void)
     lv_obj_set_style_text_color(ver_lbl, lv_color_hex(0xcccccc), 0);
 
     /* Reboot button */
-    lv_obj_t *btn_reboot = lv_btn_create(about_page);
+    lv_obj_t *btn_reboot = lv_button_create(about_page);
     lv_obj_set_size(btn_reboot, 200, 40);
     lv_obj_set_style_bg_color(btn_reboot, lv_color_hex(0x8B0000), 0);
     lv_obj_add_event_cb(btn_reboot, reboot_btn_cb, LV_EVENT_CLICKED, NULL);
