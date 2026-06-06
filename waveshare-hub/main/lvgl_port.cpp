@@ -1,7 +1,7 @@
 /**
  * @file lvgl_port.cpp
- * @brief LVGL hardware-port: RGB LCD, GT911 touch, tick, task, mutex.
- * Clean baseline derived from the stable logic_suite Waveshare 7" project.
+ * @brief LVGL 9 hardware-port: RGB LCD, GT911 touch, tick, task, mutex.
+ *        Ported from LVGL 8.3 baseline — Waveshare 7" ESP32-S3.
  */
 #include "lvgl_port.h"
 #include "definitions.h"
@@ -29,13 +29,12 @@
 
 SemaphoreHandle_t lvgl_mux = NULL;
 
-static lv_disp_draw_buf_t s_disp_buf;
-static lv_disp_drv_t      s_disp_drv;
-static SemaphoreHandle_t  s_flush_sem = NULL;
+static lv_display_t       *s_disp = NULL;
+static SemaphoreHandle_t   s_flush_sem = NULL;
+static esp_lcd_panel_handle_t s_panel = NULL;
 
-/* Bounce buffer frame-done callback — signals that a full DMA frame
-   transfer has completed and LVGL can safely write to the framebuffer
-   without tearing. */
+/* VSYNC callback — signals that a full DMA frame transfer has
+   completed and LVGL can safely write to the PSRAM framebuffer. */
 static bool IRAM_ATTR bounce_frame_done_cb(esp_lcd_panel_handle_t,
                                             const esp_lcd_rgb_panel_event_data_t *,
                                             void *)
@@ -45,36 +44,33 @@ static bool IRAM_ATTR bounce_frame_done_cb(esp_lcd_panel_handle_t,
     return woken == pdTRUE;
 }
 
-static void lvgl_tick_inc_cb(void *)
+/* LVGL 9 tick callback — returns elapsed ms since boot */
+static uint32_t lvgl_tick_get_cb(void)
 {
-    lv_tick_inc(LVGL_TICK_PERIOD_MS);
+    return (uint32_t)(esp_timer_get_time() / 1000ULL);
 }
 
-/* VSYNC-paced flush — wait for bounce buffer DMA frame boundary before
-   drawing to the PSRAM framebuffer to prevent mid-scanline tearing. */
-static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
-                           lv_color_t *color_map)
+/* LVGL 9 flush callback — signature uses uint8_t* instead of lv_color_t* */
+static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area,
+                           uint8_t *px_map)
 {
-    esp_lcd_panel_handle_t panel =
-        static_cast<esp_lcd_panel_handle_t>(drv->user_data);
-
-    /* Wait up to 50ms for DMA frame boundary — if it doesn't come,
-       flush anyway (better late than never). */
+    /* Wait up to 50ms for DMA frame boundary to prevent tearing */
     if (s_flush_sem) {
         xSemaphoreTake(s_flush_sem, pdMS_TO_TICKS(50));
     }
 
-    esp_lcd_panel_draw_bitmap(panel,
+    esp_lcd_panel_draw_bitmap(s_panel,
                                area->x1, area->y1,
                                area->x2 + 1, area->y2 + 1,
-                               color_map);
-    lv_disp_flush_ready(drv);
+                               px_map);
+    lv_display_flush_ready(disp);
 }
 
-static void lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
+/* LVGL 9 touch read callback */
+static void lvgl_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
     esp_lcd_touch_handle_t tp =
-        static_cast<esp_lcd_touch_handle_t>(drv->user_data);
+        static_cast<esp_lcd_touch_handle_t>(lv_indev_get_user_data(indev));
 
     uint16_t x[1] = {0}, y[1] = {0};
     uint8_t  cnt  = 0;
@@ -85,9 +81,9 @@ static void lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
     if (pressed && cnt > 0) {
         data->point.x = x[0];
         data->point.y = y[0];
-        data->state   = LV_INDEV_STATE_PR;
+        data->state   = LV_INDEV_STATE_PRESSED;
     } else {
-        data->state = LV_INDEV_STATE_REL;
+        data->state = LV_INDEV_STATE_RELEASED;
     }
 }
 
@@ -140,7 +136,6 @@ void lvgl_port_init(void)
     ESP_ERROR_CHECK(ret);
 
     /* RGB LCD panel — exact logic_suite timing and framebuffer mode */
-    esp_lcd_panel_handle_t panel_handle = NULL;
     esp_lcd_rgb_panel_config_t panel_cfg = {
         .clk_src  = LCD_CLK_SRC_DEFAULT,
         .timings  = {
@@ -163,9 +158,6 @@ void lvgl_port_init(void)
         .data_width       = 16,
         .bits_per_pixel   = 0,
         .num_fbs          = LCD_NUM_FB,
-        /* 10-line bounce buffer: large enough to avoid left-edge tearing from
-           too-frequent DMA restarts.  fb_size % (2 * bb_size) == 0 verified:
-           768000 % (2 * 16000) == 0.  Decouples PSRAM scanout from RGB DMA. */
         .bounce_buffer_size_px = LCD_H_RES * 10,
         .sram_trans_align = 4,
         .psram_trans_align = 64,
@@ -194,9 +186,9 @@ void lvgl_port_init(void)
         },
     };
 
-    ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_cfg, &panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_cfg, &s_panel));
 
-    /* Register bounce buffer frame-done callback for VSYNC-paced flushing */
+    /* Register VSYNC callback for flush pacing */
     s_flush_sem = xSemaphoreCreateBinary();
     const esp_lcd_rgb_panel_event_callbacks_t cbs = {
         .on_vsync = bounce_frame_done_cb,
@@ -204,10 +196,10 @@ void lvgl_port_init(void)
         .on_bounce_frame_finish = NULL,
     };
     ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(
-        panel_handle, &cbs, NULL));
+        s_panel, &cbs, NULL));
 
-    ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
-    ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
 
     /* I2C + touch */
     i2c_master_init();
@@ -227,7 +219,7 @@ void lvgl_port_init(void)
                                0x38, &buf, 1,
                                I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS);
 
-    /* GT911 touch init — exact logic_suite path */
+    /* GT911 touch init */
     esp_lcd_touch_handle_t tp = NULL;
     esp_lcd_panel_io_handle_t tp_io_handle = NULL;
 
@@ -268,44 +260,37 @@ void lvgl_port_init(void)
     ESP_LOGI(TAG, "Initialize touch controller GT911");
     ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_gt911(tp_io_handle, &tp_cfg, &tp));
 
-    /* LVGL draw buffer: single PSRAM buffer, 100 lines — exact logic_suite path */
+    /* ── LVGL 9 init ────────────────────────────────────── */
     lv_init();
 
-    void *buf1 = heap_caps_malloc(
-        LCD_H_RES * 100 * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
-    assert(buf1 && "LVGL draw buffer allocation failed");
-    lv_disp_draw_buf_init(&s_disp_buf, buf1, NULL,
-                           LCD_H_RES * 100);
+    /* Tick — use esp_timer_get_time callback */
+    lv_tick_set_cb(lvgl_tick_get_cb);
 
-    lv_disp_drv_init(&s_disp_drv);
-    s_disp_drv.hor_res    = LCD_H_RES;
-    s_disp_drv.ver_res    = LCD_V_RES;
-    s_disp_drv.flush_cb   = lvgl_flush_cb;
-    s_disp_drv.draw_buf   = &s_disp_buf;
-    s_disp_drv.user_data  = panel_handle;
-    lv_disp_t *disp = lv_disp_drv_register(&s_disp_drv);
+    /* Display — LVGL 9 API: lv_display_create + setters */
+    s_disp = lv_display_create(LCD_H_RES, LCD_V_RES);
 
-    static lv_indev_drv_t indev_drv;
-    lv_indev_drv_init(&indev_drv);
-    indev_drv.type       = LV_INDEV_TYPE_POINTER;
-    indev_drv.disp       = disp;
-    indev_drv.read_cb    = lvgl_touch_cb;
-    indev_drv.user_data  = tp;
-    lv_indev_drv_register(&indev_drv);
+    /* Draw buffer: single PSRAM buffer, 100 lines */
+    static uint8_t *draw_buf = NULL;
+    size_t buf_size = LCD_H_RES * 100 * sizeof(lv_color16_t);
+    draw_buf = (uint8_t *)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
+    assert(draw_buf && "LVGL draw buffer allocation failed");
+    lv_display_set_buffers(s_disp, draw_buf, NULL, buf_size,
+                            LV_DISPLAY_RENDER_MODE_PARTIAL);
 
-    const esp_timer_create_args_t tick_args = {
-        .callback = lvgl_tick_inc_cb,
-        .name     = "lvgl_tick",
-    };
-    esp_timer_handle_t tick_timer = NULL;
-    ESP_ERROR_CHECK(esp_timer_create(&tick_args, &tick_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(
-        tick_timer, LVGL_TICK_PERIOD_MS * 1000));
+    lv_display_set_flush_cb(s_disp, lvgl_flush_cb);
+    lv_display_set_color_format(s_disp, LV_COLOR_FORMAT_RGB565);
+
+    /* Input device — LVGL 9 API */
+    lv_indev_t *indev = lv_indev_create();
+    lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_read_cb(indev, lvgl_touch_read_cb);
+    lv_indev_set_user_data(indev, tp);
+    lv_indev_set_display(indev, s_disp);
 
     lvgl_mux = xSemaphoreCreateRecursiveMutex();
     assert(lvgl_mux && "LVGL mutex creation failed");
 
-    ESP_LOGI(TAG, "LVGL port initialised");
+    ESP_LOGI(TAG, "LVGL 9 port initialised");
 }
 
 void lvgl_port_start_task(void)

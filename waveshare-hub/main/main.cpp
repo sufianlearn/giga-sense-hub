@@ -48,8 +48,8 @@ extern "C" void app_switch_to_dashboard(void)
 {
     if (lvgl_port_lock(-1)) {
         if (!scr_dashboard) scr_dashboard = ui_dashboard_create();
-        lv_scr_load(scr_dashboard);
-        lv_obj_invalidate(lv_scr_act());
+        lv_screen_load(scr_dashboard);
+        lv_obj_invalidate(lv_screen_active());
         lvgl_port_unlock();
     }
 
@@ -81,11 +81,11 @@ extern "C" void app_switch_to_settings(void)
     if (lvgl_port_lock(-1)) {
         /* Always recreate settings to show fresh node/network status */
         if (scr_settings) {
-            lv_obj_del(scr_settings);
+            lv_obj_delete(scr_settings);
             scr_settings = NULL;
         }
         scr_settings = ui_settings_create();
-        lv_scr_load(scr_settings);
+        lv_screen_load(scr_settings);
         lvgl_port_unlock();
     }
 }
@@ -222,7 +222,7 @@ extern "C" void app_main(void)
     if (lvgl_port_lock(-1)) {
         scr_login = ui_login_create();
         /* Show login first */
-        lv_scr_load(scr_login);
+        lv_screen_load(scr_login);
         lvgl_port_unlock();
     }
 

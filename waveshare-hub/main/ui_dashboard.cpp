@@ -27,7 +27,7 @@ static lv_obj_t *scr_dash = NULL;
 
 /* Camera image widgets */
 static lv_obj_t *cam_img[2]  = {NULL, NULL};
-static lv_img_dsc_t cam_dsc[2];
+static lv_image_dsc_t cam_dsc[2];
 
 /* Status bar */
 static lv_obj_t *lbl_status  = NULL;
@@ -123,16 +123,15 @@ lv_obj_t *ui_dashboard_create(void)
     lv_obj_align(cam0_lbl, LV_ALIGN_TOP_LEFT, 2, 0);
     no_scroll(cam0_lbl);
 
-    cam_dsc[0].header.always_zero = 0;
     cam_dsc[0].header.w = CAM_FRAME_W;
     cam_dsc[0].header.h = CAM_FRAME_H;
-    cam_dsc[0].header.cf = LV_IMG_CF_TRUE_COLOR;
+    cam_dsc[0].header.cf = LV_COLOR_FORMAT_RGB565;
     cam_dsc[0].data_size = CAM_FRAME_W * CAM_FRAME_H * 2;
     cam_dsc[0].data = NULL;
 
-    cam_img[0] = lv_img_create(scr_dash);
+    cam_img[0] = lv_image_create(scr_dash);
     lv_obj_set_pos(cam_img[0], 12, 56);
-    lv_img_set_zoom(cam_img[0], (310 * 256) / CAM_FRAME_W);  /* Scale to ~310px wide */
+    lv_image_set_scale(cam_img[0], (310 * 256) / CAM_FRAME_W);  /* Scale to ~310px wide */
     no_scroll(cam_img[0]);
 
     /* ── Camera 1 ───────────────────────────────────────────── */
@@ -152,16 +151,15 @@ lv_obj_t *ui_dashboard_create(void)
     lv_obj_align(cam1_lbl, LV_ALIGN_TOP_LEFT, 2, 0);
     no_scroll(cam1_lbl);
 
-    cam_dsc[1].header.always_zero = 0;
     cam_dsc[1].header.w = CAM_FRAME_W;
     cam_dsc[1].header.h = CAM_FRAME_H;
-    cam_dsc[1].header.cf = LV_IMG_CF_TRUE_COLOR;
+    cam_dsc[1].header.cf = LV_COLOR_FORMAT_RGB565;
     cam_dsc[1].data_size = CAM_FRAME_W * CAM_FRAME_H * 2;
     cam_dsc[1].data = NULL;
 
-    cam_img[1] = lv_img_create(scr_dash);
+    cam_img[1] = lv_image_create(scr_dash);
     lv_obj_set_pos(cam_img[1], 330, 56);
-    lv_img_set_zoom(cam_img[1], (310 * 256) / CAM_FRAME_W);
+    lv_image_set_scale(cam_img[1], (310 * 256) / CAM_FRAME_W);
     no_scroll(cam_img[1]);
 
     /* ── FPS / Info bar ─────────────────────────────────────── */
@@ -224,7 +222,7 @@ lv_obj_t *ui_dashboard_create(void)
     lv_obj_align(lbl_wind, LV_ALIGN_TOP_MID, 0, 180);
 
     /* ── Settings Button ────────────────────────────────────── */
-    lv_obj_t *btn_settings = lv_btn_create(weather_card);
+    lv_obj_t *btn_settings = lv_button_create(weather_card);
     lv_obj_set_size(btn_settings, 130, 40);
     lv_obj_align(btn_settings, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(btn_settings, lv_color_hex(0x0e4d92), 0);
@@ -242,9 +240,9 @@ void ui_dashboard_update_cam(int node_idx, uint16_t *rgb_data, int w, int h)
 {
     if (node_idx < 0 || node_idx >= 2 || !cam_img[node_idx]) return;
     cam_dsc[node_idx].data = (const uint8_t *)rgb_data;
-    cam_dsc[node_idx].header.w = w;
-    cam_dsc[node_idx].header.h = h;
-    lv_img_set_src(cam_img[node_idx], &cam_dsc[node_idx]);
+    cam_dsc[node_idx].header.w = (uint32_t)w;
+    cam_dsc[node_idx].header.h = (uint32_t)h;
+    lv_image_set_src(cam_img[node_idx], &cam_dsc[node_idx]);
     invalidate_dashboard();
 }
 
