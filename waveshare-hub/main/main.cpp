@@ -78,7 +78,12 @@ extern "C" void app_switch_to_dashboard(void)
 extern "C" void app_switch_to_settings(void)
 {
     if (lvgl_port_lock(-1)) {
-        if (!scr_settings) scr_settings = ui_settings_create();
+        /* Always recreate settings to show fresh node/network status */
+        if (scr_settings) {
+            lv_obj_del(scr_settings);
+            scr_settings = NULL;
+        }
+        scr_settings = ui_settings_create();
         lv_scr_load(scr_settings);
         lvgl_port_unlock();
     }

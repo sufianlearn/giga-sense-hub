@@ -31,18 +31,38 @@ SemaphoreHandle_t lvgl_mux = NULL;
 
 static lv_disp_draw_buf_t s_disp_buf;
 static lv_disp_drv_t      s_disp_drv;
+static SemaphoreHandle_t  s_flush_sem = NULL;
+
+/* Bounce buffer frame-done callback — signals that a full DMA frame
+   transfer has completed and LVGL can safely write to the framebuffer
+   without tearing. */
+static bool IRAM_ATTR bounce_frame_done_cb(esp_lcd_panel_handle_t,
+                                            const esp_lcd_rgb_panel_event_data_t *,
+                                            void *)
+{
+    BaseType_t woken = pdFALSE;
+    if (s_flush_sem) xSemaphoreGiveFromISR(s_flush_sem, &woken);
+    return woken == pdTRUE;
+}
 
 static void lvgl_tick_inc_cb(void *)
 {
     lv_tick_inc(LVGL_TICK_PERIOD_MS);
 }
 
-/* Plain flush — exact logic_suite path: no VSYNC pacing, no bounce buffer. */
+/* VSYNC-paced flush — wait for bounce buffer DMA frame boundary before
+   drawing to the PSRAM framebuffer to prevent mid-scanline tearing. */
 static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
                            lv_color_t *color_map)
 {
     esp_lcd_panel_handle_t panel =
         static_cast<esp_lcd_panel_handle_t>(drv->user_data);
+
+    /* Wait up to 50ms for DMA frame boundary — if it doesn't come,
+       flush anyway (better late than never). */
+    if (s_flush_sem) {
+        xSemaphoreTake(s_flush_sem, pdMS_TO_TICKS(50));
+    }
 
     esp_lcd_panel_draw_bitmap(panel,
                                area->x1, area->y1,
@@ -175,6 +195,16 @@ void lvgl_port_init(void)
     };
 
     ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_cfg, &panel_handle));
+
+    /* Register bounce buffer frame-done callback for VSYNC-paced flushing */
+    s_flush_sem = xSemaphoreCreateBinary();
+    const esp_lcd_rgb_panel_event_callbacks_t cbs = {
+        .on_vsync = bounce_frame_done_cb,
+        .on_bounce_empty = NULL,
+        .on_bounce_frame_finish = NULL,
+    };
+    ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(
+        panel_handle, &cbs, NULL));
 
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
