@@ -19,9 +19,9 @@ void hmac_sign(const char *path, char *hmac_out, char *nonce_out)
     uint32_t r = esp_random();
     snprintf(nonce_out, 16, "%08lx", (unsigned long)r);
 
-    /* Build message: path + nonce */
+    /* Build message: "nonce:path" — matches ESP32 node verifier format */
     char msg[256];
-    snprintf(msg, sizeof(msg), "%s%s", path, nonce_out);
+    snprintf(msg, sizeof(msg), "%s:%s", nonce_out, path);
 
     /* HMAC-SHA256 */
     unsigned char hash[32];

@@ -3,6 +3,7 @@
  * @brief MJPEG stream client — connects to ESP32 camera nodes.
  *        Runs in dedicated FreeRTOS tasks (one per camera).
  */
+#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
 #include "stream_client.h"
 #include "hmac_auth.h"
 #include "definitions.h"
@@ -87,19 +88,32 @@ void scan_for_nodes(void)
     if (!s_stream_client_initialized) return;
     int found = 0;
     for (int i = 0; i < MAX_NODES; i++) {
+        /* Skip nodes that are already actively streaming — the Arduino
+           WebServer is single-threaded and can't serve /info while
+           /stream is being served. Probing would timeout and we'd
+           incorrectly mark the node as lost. */
+        if (g_nodes[i].active && g_nodes[i].stream_connected) {
+            found++;
+            continue;
+        }
+
+        char probe_ip[20];
+        snprintf(probe_ip, sizeof(probe_ip), "192.168.4.%d", 2 + i);
+
         struct sockaddr_in addr = {};
         addr.sin_family = AF_INET;
         addr.sin_port = htons(STREAM_PORT);
-        inet_pton(AF_INET, g_nodes[i].ip, &addr.sin_addr);
+        inet_pton(AF_INET, probe_ip, &addr.sin_addr);
 
         int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (sock < 0) continue;
+        if (sock < 0) { ESP_LOGW(TAG, "Node %d: socket() failed", i); continue; }
 
         /* Short connect timeout */
-        struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };
+        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
         setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
         if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+            ESP_LOGD(TAG, "Node %d: connect to %s failed", i, probe_ip);
             close(sock);
             if (g_nodes[i].active) {
                 ESP_LOGI(TAG, "Node %d lost", i);
@@ -107,6 +121,10 @@ void scan_for_nodes(void)
             }
             continue;
         }
+
+        /* Set recv timeout for reading response */
+        struct timeval rtv = { .tv_sec = 2, .tv_usec = 0 };
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
 
         /* Send /info request with HMAC */
         char hmac[65], nonce[16];
@@ -118,31 +136,51 @@ void scan_for_nodes(void)
             "X-GSH-Auth: %s\r\n"
             "X-GSH-Nonce: %s\r\n"
             "\r\n",
-            NODE_INFO_PATH, g_nodes[i].ip, hmac, nonce);
+            NODE_INFO_PATH, probe_ip, hmac, nonce);
         send(sock, req, strlen(req), 0);
 
-        /* Read response */
+        /* Read response — parse headers line-by-line, then block-read body */
         char line[256];
-        bool in_body = false;
         char body[512] = "";
-        while (read_line(sock, line, sizeof(line), 1000) >= 0) {
-            if (!in_body && strlen(line) == 0) { in_body = true; continue; }
-            if (in_body) strncat(body, line, sizeof(body) - strlen(body) - 1);
+        int content_length = 0;
+
+        /* Read headers until blank line */
+        while (read_line(sock, line, sizeof(line), 2000) >= 0) {
+            if (strlen(line) == 0) break;
+            if (strncasecmp(line, "Content-Length:", 15) == 0) {
+                content_length = atoi(line + 15);
+            }
+        }
+
+        /* Block-read the body using Content-Length */
+        if (content_length > 0 && content_length < (int)sizeof(body) - 1) {
+            int rd = 0;
+            while (rd < content_length) {
+                int r = recv(sock, body + rd, content_length - rd, 0);
+                if (r <= 0) break;
+                rd += r;
+            }
+            body[rd] = '\0';
         }
         close(sock);
 
-        /* Parse nodeId */
+        ESP_LOGI(TAG, "Node %d: /info body='%.200s'", i, body);
+
+        /* Parse nodeId from response — but always use the DHCP probe IP
+           (slot i = 192.168.4.(2+i)).  Don't remap by nodeId because the
+           Arduino WebServer is single-threaded and nodeId might not match
+           DHCP order, causing IP overwrites. */
         char *nid_ptr = strstr(body, "\"nodeId\":");
         if (nid_ptr) {
             int nid = atoi(nid_ptr + 9);
-            if (nid >= 0 && nid < MAX_NODES) {
-                if (!g_nodes[nid].active) {
-                    ESP_LOGI(TAG, "Found node %d at %s", nid, g_nodes[i].ip);
-                }
-                g_nodes[nid].active = true;
-                strncpy(g_nodes[nid].ip, g_nodes[i].ip, sizeof(g_nodes[nid].ip));
-                found++;
+            ESP_LOGI(TAG, "Found nodeId %d at %s → slot %d", nid, probe_ip, i);
+            if (!g_nodes[i].active) {
+                ESP_LOGI(TAG, "Activating node slot %d (nodeId=%d) at %s", i, nid, probe_ip);
             }
+            g_nodes[i].active = true;
+            strncpy(g_nodes[i].ip, probe_ip, sizeof(g_nodes[i].ip));
+            g_nodes[i].node_id = nid;
+            found++;
         }
     }
     g_active_node_count = found;
@@ -197,7 +235,7 @@ bool connect_stream(int node_idx)
             if (strncmp(line, boundary_marker, strlen(boundary_marker)) == 0) {
                 node.sock = sock;
                 node.stream_connected = true;
-                ESP_LOGI(TAG, "Stream connected to node %d", node_idx);
+                ESP_LOGI(TAG, "Stream connected to node %d at %s", node_idx, node.ip);
                 return true;
             }
         }
@@ -227,7 +265,12 @@ bool read_frame(int node_idx)
         }
     }
 
-    if (clen <= 0 || clen > JPEG_BUF_SIZE) return false;
+    if (clen <= 0 || clen > JPEG_BUF_SIZE) {
+        /* Bad frame size — disconnect to avoid corrupted socket state */
+        ESP_LOGW(TAG, "Node %d: bad Content-Length %d, disconnecting", node_idx, clen);
+        disconnect_stream(node_idx);
+        return false;
+    }
 
     /* Read JPEG body */
     int rd = 0;

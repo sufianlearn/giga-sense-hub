@@ -36,6 +36,7 @@ static int      s_fps[2]        = {0, 0};
 static int      s_frame_cnt[2]  = {0, 0};
 static uint32_t s_fps_tick[2]   = {0, 0};
 static bool     s_runtime_tasks_started = false;
+static SemaphoreHandle_t s_scan_mutex = NULL;
 
 static void cam_stream_task(void *arg);
 static void status_task(void *arg);
@@ -59,6 +60,11 @@ extern "C" void app_switch_to_dashboard(void)
         }
 
         s_runtime_tasks_started = true;
+        s_scan_mutex = xSemaphoreCreateMutex();
+        if (!s_scan_mutex) {
+            ESP_LOGE(TAG, "Failed to create scan mutex");
+            return;
+        }
         xTaskCreatePinnedToCore(cam_stream_task, "cam0", 8192,
                                 (void *)0, 4, NULL, 1);
         xTaskCreatePinnedToCore(cam_stream_task, "cam1", 8192,
@@ -93,9 +99,13 @@ static void cam_stream_task(void *arg)
     uint32_t scan_tick = 0;
 
     while (true) {
-        /* Periodic node scan */
+        /* Periodic node scan — mutex prevents concurrent /info requests
+           that overwhelm the single-threaded Arduino WebServer on camera nodes */
         if (xTaskGetTickCount() - scan_tick > pdMS_TO_TICKS(5000)) {
-            scan_for_nodes();
+            if (xSemaphoreTake(s_scan_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                scan_for_nodes();
+                xSemaphoreGive(s_scan_mutex);
+            }
             scan_tick = xTaskGetTickCount();
         }
 
