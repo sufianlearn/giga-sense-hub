@@ -18,6 +18,7 @@
 #include "ui_dashboard.h"
 #include "stream_client.h"
 #include "weather.h"
+#include "wifi_ap.h"
 #include "definitions.h"
 #include "esp_log.h"
 #include <stdio.h>
@@ -249,18 +250,19 @@ void ui_dashboard_update_cam(int node_idx, uint16_t *rgb_data, int w, int h)
 
 void ui_dashboard_update_weather(void)
 {
-    if (!g_weather.valid) return;
+    weather_data_t w = weather_get();
+    if (!w.valid) return;
 
     char buf[32];
-    snprintf(buf, sizeof(buf), "%.1f°C", g_weather.temperature);
+    snprintf(buf, sizeof(buf), "%.1f°C", w.temperature);
     lv_label_set_text(lbl_temp, buf);
 
-    lv_label_set_text(lbl_desc, g_weather.description);
+    lv_label_set_text(lbl_desc, w.description);
 
-    snprintf(buf, sizeof(buf), "Wind: %.0f km/h", g_weather.wind_speed);
+    snprintf(buf, sizeof(buf), "Wind: %.0f km/h", w.wind_speed);
     lv_label_set_text(lbl_wind, buf);
 
-    lv_label_set_text(lbl_weather_icon, weather_code_to_icon(g_weather.weather_code));
+    lv_label_set_text(lbl_weather_icon, weather_code_to_icon(w.weather_code));
     invalidate_dashboard();
 }
 
@@ -268,10 +270,11 @@ void ui_dashboard_update_status(void)
 {
     char buf[128];
     snprintf(buf, sizeof(buf),
-             LV_SYMBOL_WIFI "  GigaSenseHub  |  Nodes: %d  |  N0:%s N1:%s  |  WiFi: AP",
+             LV_SYMBOL_WIFI "  GigaSenseHub  |  Nodes: %d  |  N0:%s N1:%s  |  Net: %s",
              g_active_node_count,
              g_nodes[0].active ? "ON" : "--",
-             g_nodes[1].active ? "ON" : "--");
+             g_nodes[1].active ? "ON" : "--",
+             wifi_sta_is_connected() ? "Online" : "AP only");
     lv_label_set_text(lbl_status, buf);
     lv_obj_set_style_text_color(lbl_status,
         g_active_node_count > 0 ? lv_color_hex(0x00ff88) : lv_color_hex(0xff8800), 0);

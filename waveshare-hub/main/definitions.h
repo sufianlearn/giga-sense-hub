@@ -63,9 +63,9 @@
 #define NODE_BASE_IP            "192.168.4.2"
 
 /* ── Weather ───────────────────────────────────────────────────────── */
-#define WEATHER_CITY            "Moosburg an der Isar"
-#define WEATHER_LAT             "48.4681"
-#define WEATHER_LON             "11.9381"
+#define WEATHER_CITY            "Munich"
+#define WEATHER_LAT             "48.1351"
+#define WEATHER_LON             "11.5820"
 
 /* ── Logging tag ───────────────────────────────────────────────────── */
 #define TAG                     "gsh_ws"

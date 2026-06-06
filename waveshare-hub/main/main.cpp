@@ -40,6 +40,7 @@ static SemaphoreHandle_t s_scan_mutex = NULL;
 
 static void cam_stream_task(void *arg);
 static void status_task(void *arg);
+static void weather_task(void *arg);
 
 /* ── Screen navigation (called from UI modules) ──────────── */
 
@@ -70,8 +71,8 @@ extern "C" void app_switch_to_dashboard(void)
         xTaskCreatePinnedToCore(cam_stream_task, "cam1", 8192,
                                 (void *)1, 4, NULL, 1);
         xTaskCreate(status_task, "status", 4096, NULL, 2, NULL);
-        /* Weather remains disabled in SoftAP-only camera mode. */
-        ESP_LOGI(TAG, "Wireless camera runtime tasks launched");
+        xTaskCreate(weather_task, "weather", 8192, NULL, 2, NULL);
+        ESP_LOGI(TAG, "Runtime tasks launched (cam0, cam1, status, weather)");
     }
 }
 
@@ -173,6 +174,29 @@ static void status_task(void *arg)
     }
 }
 
+/* ── Weather fetch task ───────────────────────────────────── */
+
+static void weather_task(void *arg)
+{
+    ESP_LOGI(TAG, "Weather task started, waiting for STA...");
+
+    /* Wait for STA to connect to home router */
+    while (!wifi_sta_is_connected()) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+    ESP_LOGI(TAG, "STA connected, starting weather fetches");
+
+    while (true) {
+        if (weather_fetch()) {
+            ESP_LOGI(TAG, "Weather updated successfully");
+        } else {
+            ESP_LOGW(TAG, "Weather fetch failed, will retry");
+        }
+        /* Fetch every 15 minutes */
+        vTaskDelay(pdMS_TO_TICKS(15 * 60 * 1000));
+    }
+}
+
 /* ── Entry point ──────────────────────────────────────────── */
 
 extern "C" void app_main(void)
@@ -188,6 +212,9 @@ extern "C" void app_main(void)
 
     /* 3. Stream client buffers/state. Runtime tasks start after PIN. */
     stream_client_init();
+
+    /* 4. Weather module init */
+    weather_init();
 
     /* 4. Build UI screens — only create login initially.
        Dashboard/settings created lazily on first navigation
