@@ -33,6 +33,7 @@ lv_obj_t *ui_settings_create(void)
     scr_settings = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr_settings, lv_color_hex(0x0f0f23), 0);
     lv_obj_clear_flag(scr_settings, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(scr_settings, LV_DIR_NONE);
 
     /* ── Menu ─────────────────────────────────────────── */
     lv_obj_t *menu = lv_menu_create(scr_settings);

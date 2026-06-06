@@ -1,7 +1,7 @@
 /**
  * @file lvgl_port.cpp
  * @brief LVGL hardware-port: RGB LCD, GT911 touch, tick, task, mutex.
- *        Copied from logic_suite reference project (Waveshare 7" ESP32-S3).
+ * Clean baseline derived from the stable logic_suite Waveshare 7" project.
  */
 #include "lvgl_port.h"
 #include "definitions.h"
@@ -14,6 +14,7 @@
 #include "esp_timer.h"
 #include "esp_err.h"
 #include "esp_rom_sys.h"
+#include "esp_heap_caps.h"
 #include "driver/i2c.h"
 #include "driver/gpio.h"
 #include "nvs_flash.h"
@@ -24,11 +25,22 @@
 #include "esp_lcd_touch_gt911.h"
 
 #include "lvgl.h"
+#include <assert.h>
 
 SemaphoreHandle_t lvgl_mux = NULL;
 
 static lv_disp_draw_buf_t s_disp_buf;
 static lv_disp_drv_t      s_disp_drv;
+static SemaphoreHandle_t  s_vsync_sem = NULL;
+
+static bool rgb_vsync_cb(esp_lcd_panel_handle_t, const esp_lcd_rgb_panel_event_data_t *, void *)
+{
+    BaseType_t hp_task_woken = pdFALSE;
+    if (s_vsync_sem) {
+        xSemaphoreGiveFromISR(s_vsync_sem, &hp_task_woken);
+    }
+    return hp_task_woken == pdTRUE;
+}
 
 static void lvgl_tick_inc_cb(void *)
 {
@@ -40,6 +52,13 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
 {
     esp_lcd_panel_handle_t panel =
         static_cast<esp_lcd_panel_handle_t>(drv->user_data);
+
+    /* DMA clue: pace the PSRAM framebuffer write to RGB VSYNC so LVGL's
+       copy does not race the RGB DMA scanout. */
+    if (s_vsync_sem) {
+        xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(20));
+    }
+
     esp_lcd_panel_draw_bitmap(panel,
                                area->x1, area->y1,
                                area->x2 + 1, area->y2 + 1,
@@ -115,7 +134,7 @@ void lvgl_port_init(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    /* RGB LCD panel */
+    /* RGB LCD panel — exact logic_suite timing and framebuffer mode */
     esp_lcd_panel_handle_t panel_handle = NULL;
     esp_lcd_rgb_panel_config_t panel_cfg = {
         .clk_src  = LCD_CLK_SRC_DEFAULT,
@@ -140,7 +159,9 @@ void lvgl_port_init(void)
         .data_width       = 16,
         .bits_per_pixel   = 0,
         .num_fbs          = LCD_NUM_FB,
-        .bounce_buffer_size_px = 0,
+        /* Small internal bounce buffer decouples RGB DMA from PSRAM scanout.
+           Keep it tiny: 2 lines avoids the previous SRAM-pressure dark screen. */
+        .bounce_buffer_size_px = LCD_H_RES * 2,
         .sram_trans_align = 0,
         .psram_trans_align = 64,
         .hsync_gpio_num   = PIN_NUM_HSYNC,
@@ -169,6 +190,14 @@ void lvgl_port_init(void)
     };
 
     ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_cfg, &panel_handle));
+
+    s_vsync_sem = xSemaphoreCreateBinary();
+    assert(s_vsync_sem && "VSYNC semaphore creation failed");
+    const esp_lcd_rgb_panel_event_callbacks_t cbs = {
+        .on_vsync = rgb_vsync_cb,
+    };
+    ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(panel_handle, &cbs, NULL));
+
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
 
@@ -190,7 +219,7 @@ void lvgl_port_init(void)
                                0x38, &buf, 1,
                                I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS);
 
-    /* GT911 touch init */
+    /* GT911 touch init — exact logic_suite path */
     esp_lcd_touch_handle_t tp = NULL;
     esp_lcd_panel_io_handle_t tp_io_handle = NULL;
 
@@ -204,6 +233,8 @@ void lvgl_port_init(void)
 
     esp_lcd_panel_io_i2c_config_t tp_io_cfg = {};
     tp_io_cfg.dev_addr = ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS;
+    tp_io_cfg.on_color_trans_done = NULL;
+    tp_io_cfg.user_ctx = NULL;
     tp_io_cfg.control_phase_bytes = 1;
     tp_io_cfg.dc_bit_offset = 0;
     tp_io_cfg.lcd_cmd_bits = 16;
@@ -229,13 +260,19 @@ void lvgl_port_init(void)
     ESP_LOGI(TAG, "Initialize touch controller GT911");
     ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_gt911(tp_io_handle, &tp_cfg, &tp));
 
-    /* LVGL init */
+    /* LVGL init — DMA-safe draw buffers. Keep LVGL's temporary draw buffers
+       in internal DMA RAM so rendering does not hammer PSRAM while RGB DMA
+       scans the PSRAM framebuffers. */
     lv_init();
 
+    constexpr size_t LVGL_BUF_LINES = 10;
+    constexpr size_t LVGL_BUF_PIXELS = LCD_H_RES * LVGL_BUF_LINES;
     void *buf1 = heap_caps_malloc(
-        LCD_H_RES * 100 * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
-    assert(buf1 && "LVGL draw buffer allocation failed");
-    lv_disp_draw_buf_init(&s_disp_buf, buf1, NULL, LCD_H_RES * 100);
+        LVGL_BUF_PIXELS * sizeof(lv_color_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    void *buf2 = heap_caps_malloc(
+        LVGL_BUF_PIXELS * sizeof(lv_color_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    assert(buf1 && buf2 && "Internal DMA LVGL draw buffers allocation failed");
+    lv_disp_draw_buf_init(&s_disp_buf, buf1, buf2, LVGL_BUF_PIXELS);
 
     lv_disp_drv_init(&s_disp_drv);
     s_disp_drv.hor_res    = LCD_H_RES;
@@ -243,9 +280,10 @@ void lvgl_port_init(void)
     s_disp_drv.flush_cb   = lvgl_flush_cb;
     s_disp_drv.draw_buf   = &s_disp_buf;
     s_disp_drv.user_data  = panel_handle;
+    s_disp_drv.full_refresh = 0;
+    s_disp_drv.direct_mode  = 0;
     lv_disp_t *disp = lv_disp_drv_register(&s_disp_drv);
 
-    /* Touch indev */
     static lv_indev_drv_t indev_drv;
     lv_indev_drv_init(&indev_drv);
     indev_drv.type       = LV_INDEV_TYPE_POINTER;
@@ -254,7 +292,6 @@ void lvgl_port_init(void)
     indev_drv.user_data  = tp;
     lv_indev_drv_register(&indev_drv);
 
-    /* Tick timer */
     const esp_timer_create_args_t tick_args = {
         .callback = lvgl_tick_inc_cb,
         .name     = "lvgl_tick",
@@ -264,7 +301,6 @@ void lvgl_port_init(void)
     ESP_ERROR_CHECK(esp_timer_start_periodic(
         tick_timer, LVGL_TICK_PERIOD_MS * 1000));
 
-    /* Mutex */
     lvgl_mux = xSemaphoreCreateRecursiveMutex();
     assert(lvgl_mux && "LVGL mutex creation failed");
 
@@ -274,7 +310,7 @@ void lvgl_port_init(void)
 void lvgl_port_start_task(void)
 {
     xTaskCreate(lvgl_port_task, "lvgl",
-                LVGL_TASK_STACK_SIZE,
+                LVGL_TASK_STACK_SIZE * 2,
                 NULL, LVGL_TASK_PRIORITY, NULL);
     ESP_LOGI(TAG, "LVGL task started");
 }

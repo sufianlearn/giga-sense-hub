@@ -3,7 +3,8 @@
 /* ── Display geometry ──────────────────────────────────────────────── */
 #define LCD_H_RES               800
 #define LCD_V_RES               480
-#define LCD_PIXEL_CLOCK_HZ      (18 * 1000 * 1000)
+/* Lower RGB PCLK to reduce ESP32-S3 RGB DMA/PSRAM contention ghost-scroll. */
+#define LCD_PIXEL_CLOCK_HZ      (12 * 1000 * 1000)
 #define LCD_NUM_FB              2
 
 /* ── Backlight ─────────────────────────────────────────────────────── */
@@ -45,7 +46,7 @@
 #define LVGL_TICK_PERIOD_MS     2
 #define LVGL_TASK_MAX_DELAY_MS  500
 #define LVGL_TASK_MIN_DELAY_MS  1
-#define LVGL_TASK_STACK_SIZE    (8 * 1024)
+#define LVGL_TASK_STACK_SIZE    (4 * 1024)
 #define LVGL_TASK_PRIORITY      2
 
 /* ── Camera stream ─────────────────────────────────────────────────── */

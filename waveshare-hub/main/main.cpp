@@ -35,6 +35,10 @@ static lv_obj_t *scr_settings  = NULL;
 static int      s_fps[2]        = {0, 0};
 static int      s_frame_cnt[2]  = {0, 0};
 static uint32_t s_fps_tick[2]   = {0, 0};
+static bool     s_runtime_tasks_started = false;
+
+static void cam_stream_task(void *arg);
+static void status_task(void *arg);
 
 /* ── Screen navigation (called from UI modules) ──────────── */
 
@@ -45,6 +49,10 @@ extern "C" void app_switch_to_dashboard(void)
         lv_scr_load(scr_dashboard);
         lvgl_port_unlock();
     }
+
+    /* Baseline mode: after PIN, only show the dashboard screen.
+       Runtime tasks stay disabled until display/touch/dashboard are stable. */
+    ESP_LOGI(TAG, "Baseline mode: dashboard shown; runtime tasks remain disabled");
 }
 
 extern "C" void app_switch_to_settings(void)
@@ -146,32 +154,20 @@ extern "C" void app_main(void)
     lvgl_port_init();
     lvgl_port_start_task();
 
-    /* 2. WiFi Access Point */
-    wifi_ap_init();
+    /* 2/3. Baseline login-only test.
+       Keep WiFi AP, camera stream buffers, weather, and runtime tasks OFF
+       until display + touch match the stable logic_suite baseline. */
+    ESP_LOGI(TAG, "Baseline mode: WiFi/stream/weather disabled");
 
-    /* 3. Stream client buffers */
-    stream_client_init();
-
-    /* 4. Build UI screens */
+    /* 4. Build UI screens — only create login initially.
+       Dashboard/settings created lazily on first navigation
+       to avoid PSRAM bandwidth contention with RGB LCD DMA. */
     if (lvgl_port_lock(-1)) {
         scr_login = ui_login_create();
-        scr_dashboard = ui_dashboard_create();
         /* Show login first */
         lv_scr_load(scr_login);
         lvgl_port_unlock();
     }
 
-    /* 5. Start camera stream tasks (pinned to core 1 to not block LVGL on core 0) */
-    xTaskCreatePinnedToCore(cam_stream_task, "cam0", 8192,
-                            (void *)0, 4, NULL, 1);
-    xTaskCreatePinnedToCore(cam_stream_task, "cam1", 8192,
-                            (void *)1, 4, NULL, 1);
-
-    /* 6. Status update task */
-    xTaskCreate(status_task, "status", 4096, NULL, 2, NULL);
-
-    /* 7. Weather (needs internet — will fail in AP-only mode but gracefully) */
-    weather_task_start();
-
-    ESP_LOGI(TAG, "All tasks launched");
+    ESP_LOGI(TAG, "Login shown; runtime tasks start after PIN");
 }

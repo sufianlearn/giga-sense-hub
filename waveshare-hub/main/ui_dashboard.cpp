@@ -55,6 +55,7 @@ lv_obj_t *ui_dashboard_create(void)
     scr_dash = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr_dash, lv_color_hex(0x0f0f23), 0);
     lv_obj_clear_flag(scr_dash, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(scr_dash, LV_DIR_NONE);
 
     /* ── Status Bar ─────────────────────────────────────────── */
     lv_obj_t *bar = lv_obj_create(scr_dash);
