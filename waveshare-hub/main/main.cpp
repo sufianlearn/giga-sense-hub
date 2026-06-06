@@ -50,9 +50,22 @@ extern "C" void app_switch_to_dashboard(void)
         lvgl_port_unlock();
     }
 
-    /* Baseline mode: after PIN, only show the dashboard screen.
-       Runtime tasks stay disabled until display/touch/dashboard are stable. */
-    ESP_LOGI(TAG, "Baseline mode: dashboard shown; runtime tasks remain disabled");
+    if (!s_runtime_tasks_started) {
+        if (!wifi_ap_is_started() || !stream_client_is_initialized()) {
+            ESP_LOGE(TAG, "Runtime start blocked: wifi=%d stream=%d",
+                     wifi_ap_is_started(), stream_client_is_initialized());
+            return;
+        }
+
+        s_runtime_tasks_started = true;
+        xTaskCreatePinnedToCore(cam_stream_task, "cam0", 8192,
+                                (void *)0, 4, NULL, 1);
+        xTaskCreatePinnedToCore(cam_stream_task, "cam1", 8192,
+                                (void *)1, 4, NULL, 1);
+        xTaskCreate(status_task, "status", 4096, NULL, 2, NULL);
+        /* Weather remains disabled in SoftAP-only camera mode. */
+        ESP_LOGI(TAG, "Wireless camera runtime tasks launched");
+    }
 }
 
 extern "C" void app_switch_to_settings(void)
@@ -154,10 +167,11 @@ extern "C" void app_main(void)
     lvgl_port_init();
     lvgl_port_start_task();
 
-    /* 2/3. Baseline login-only test.
-       Keep WiFi AP, camera stream buffers, weather, and runtime tasks OFF
-       until display + touch match the stable logic_suite baseline. */
-    ESP_LOGI(TAG, "Baseline mode: WiFi/stream/weather disabled");
+    /* 2. WiFi Access Point — camera nodes connect to this SoftAP. */
+    wifi_ap_init();
+
+    /* 3. Stream client buffers/state. Runtime tasks start after PIN. */
+    stream_client_init();
 
     /* 4. Build UI screens — only create login initially.
        Dashboard/settings created lazily on first navigation

@@ -29,6 +29,7 @@ extern uint16_t *g_rgb_buf[2];
 extern bool      g_rgb_ready[2];
 
 void stream_client_init(void);
+bool stream_client_is_initialized(void);
 void scan_for_nodes(void);
 bool connect_stream(int node_idx);
 bool read_frame(int node_idx);

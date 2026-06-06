@@ -25,9 +25,18 @@ int           g_jpeg_len[2] = {0, 0};
 bool          g_frame_ready[2] = {false, false};
 uint16_t     *g_rgb_buf[2] = {NULL, NULL};
 bool          g_rgb_ready[2] = {false, false};
+static bool   s_stream_client_initialized = false;
 
 void stream_client_init(void)
 {
+    if (s_stream_client_initialized) {
+        ESP_LOGI(TAG, "Stream client already initialized");
+        return;
+    }
+
+    memset(g_nodes, 0, sizeof(g_nodes));
+    g_active_node_count = 0;
+
     for (int i = 0; i < MAX_NODES; i++) {
         g_nodes[i].node_id = i;
         g_nodes[i].active = false;
@@ -38,8 +47,19 @@ void stream_client_init(void)
         g_jpeg_buf[i] = (uint8_t *)heap_caps_malloc(JPEG_BUF_SIZE, MALLOC_CAP_SPIRAM);
         /* Allocate RGB565 buffer in PSRAM (320x240x2 = 153600 bytes) */
         g_rgb_buf[i] = (uint16_t *)heap_caps_malloc(CAM_FRAME_W * CAM_FRAME_H * 2, MALLOC_CAP_SPIRAM);
+
+        if (!g_jpeg_buf[i] || !g_rgb_buf[i]) {
+            ESP_LOGE(TAG, "Stream buffer allocation failed for node %d jpeg=%p rgb=%p",
+                     i, g_jpeg_buf[i], g_rgb_buf[i]);
+            abort();
+        }
     }
+
+    s_stream_client_initialized = true;
+    ESP_LOGI(TAG, "Stream client initialized for %d nodes", MAX_NODES);
 }
+
+bool stream_client_is_initialized(void) { return s_stream_client_initialized; }
 
 static int read_line(int sock, char *buf, int maxlen, int timeout_ms)
 {
@@ -64,6 +84,7 @@ static int read_line(int sock, char *buf, int maxlen, int timeout_ms)
 
 void scan_for_nodes(void)
 {
+    if (!s_stream_client_initialized) return;
     int found = 0;
     for (int i = 0; i < MAX_NODES; i++) {
         struct sockaddr_in addr = {};
@@ -129,6 +150,7 @@ void scan_for_nodes(void)
 
 bool connect_stream(int node_idx)
 {
+    if (!s_stream_client_initialized) return false;
     if (node_idx < 0 || node_idx >= MAX_NODES) return false;
     camera_node_t &node = g_nodes[node_idx];
     if (!node.active) return false;
@@ -187,6 +209,7 @@ bool connect_stream(int node_idx)
 
 bool read_frame(int node_idx)
 {
+    if (!s_stream_client_initialized) return false;
     if (node_idx < 0 || node_idx >= MAX_NODES) return false;
     camera_node_t &node = g_nodes[node_idx];
     if (!node.stream_connected || node.sock < 0) return false;
