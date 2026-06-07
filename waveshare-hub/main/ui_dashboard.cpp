@@ -261,6 +261,8 @@ void ui_dashboard_update_weather(void)
     lv_label_set_text(lbl_wind, buf);
 
     lv_label_set_text(lbl_weather_icon, weather_code_to_icon(w.weather_code));
+    lv_obj_set_style_text_color(lbl_weather_icon,
+        lv_color_hex(weather_code_to_color(w.weather_code)), 0);
     invalidate_dashboard();
 }
 

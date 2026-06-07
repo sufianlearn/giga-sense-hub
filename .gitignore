@@ -7,3 +7,7 @@
 *.map
 wifi_credentials.h
 wifi_secrets.h
+
+# Test binaries
+waveshare-hub/test/test_i18n
+waveshare-hub/test/test_weather_codes
