@@ -271,10 +271,17 @@ void lvgl_port_init(void)
     /* Display — LVGL 9 API: lv_display_create + setters */
     s_disp = lv_display_create(LCD_H_RES, LCD_V_RES);
 
-    /* Draw buffer: single PSRAM buffer, 100 lines */
+    /* Draw buffer: single buffer in internal SRAM for faster flush.
+       Using 20 lines (smaller than before) to fit in internal SRAM
+       and avoid PSRAM bandwidth contention with RGB LCD DMA. */
     static uint8_t *draw_buf = NULL;
-    size_t buf_size = LCD_H_RES * 100 * sizeof(lv_color16_t);
-    draw_buf = (uint8_t *)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
+    size_t buf_size = LCD_H_RES * 20 * sizeof(lv_color16_t);
+    draw_buf = (uint8_t *)heap_caps_malloc(buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (!draw_buf) {
+        /* Fallback to PSRAM if internal RAM is tight */
+        draw_buf = (uint8_t *)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
+        ESP_LOGW(TAG, "LVGL draw buffer in PSRAM (internal alloc failed)");
+    }
     assert(draw_buf && "LVGL draw buffer allocation failed");
     lv_display_set_buffers(s_disp, draw_buf, NULL, buf_size,
                             LV_DISPLAY_RENDER_MODE_PARTIAL);

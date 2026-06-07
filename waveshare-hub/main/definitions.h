@@ -46,7 +46,7 @@
 #define LVGL_TASK_MAX_DELAY_MS  500
 #define LVGL_TASK_MIN_DELAY_MS  1
 #define LVGL_TASK_STACK_SIZE    (4 * 1024)
-#define LVGL_TASK_PRIORITY      2
+#define LVGL_TASK_PRIORITY      4
 
 /* ── Camera stream ─────────────────────────────────────────────────── */
 #define MAX_NODES               2
