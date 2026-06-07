@@ -5,6 +5,7 @@
  */
 #include "lvgl_port.h"
 #include "definitions.h"
+#include "power_mgmt.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -82,6 +83,7 @@ static void lvgl_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
         data->point.x = x[0];
         data->point.y = y[0];
         data->state   = LV_INDEV_STATE_PRESSED;
+        power_mgmt_reset_idle();  /* Wake from dim/off on touch */
     } else {
         data->state = LV_INDEV_STATE_RELEASED;
     }

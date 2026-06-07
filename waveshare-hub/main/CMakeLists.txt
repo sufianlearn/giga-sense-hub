@@ -9,7 +9,11 @@ idf_component_register(
         "ui_login.cpp"
         "ui_dashboard.cpp"
         "ui_settings.cpp"
+        "ui_toast.cpp"
         "hmac_auth.cpp"
+        "power_mgmt.cpp"
+        "settings.cpp"
+        "i18n.cpp"
     INCLUDE_DIRS "."
     REQUIRES
         esp_lcd

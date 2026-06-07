@@ -16,6 +16,10 @@
 #include "stream_client.h"
 #include "jpeg_decoder.h"
 #include "weather.h"
+#include "power_mgmt.h"
+#include "settings.h"
+#include "i18n.h"
+#include "ui_toast.h"
 #include "ui_login.h"
 #include "ui_dashboard.h"
 #include "ui_settings.h"
@@ -48,8 +52,7 @@ extern "C" void app_switch_to_dashboard(void)
 {
     if (lvgl_port_lock(-1)) {
         if (!scr_dashboard) scr_dashboard = ui_dashboard_create();
-        lv_screen_load(scr_dashboard);
-        lv_obj_invalidate(lv_screen_active());
+        lv_screen_load_anim(scr_dashboard, LV_SCR_LOAD_ANIM_FADE_IN, 300, 0, false);
         lvgl_port_unlock();
     }
 
@@ -85,7 +88,7 @@ extern "C" void app_switch_to_settings(void)
             scr_settings = NULL;
         }
         scr_settings = ui_settings_create();
-        lv_screen_load(scr_settings);
+        lv_screen_load_anim(scr_settings, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
         lvgl_port_unlock();
     }
 }
@@ -164,10 +167,27 @@ static void cam_stream_task(void *arg)
 
 static void status_task(void *arg)
 {
+    bool prev_node_state[2] = {false, false};
+
     while (true) {
+        /* Power management tick */
+        power_mgmt_tick();
+
         if (lvgl_port_lock(50)) {
             ui_dashboard_update_status();
             ui_dashboard_update_weather();
+
+            /* Toast on camera connect/disconnect */
+            for (int i = 0; i < MAX_NODES; i++) {
+                if (g_nodes[i].active != prev_node_state[i]) {
+                    char msg[64];
+                    snprintf(msg, sizeof(msg), "Camera %d %s", i,
+                             g_nodes[i].active ? "connected" : "disconnected");
+                    ui_toast_show(msg,
+                        g_nodes[i].active ? TOAST_SUCCESS : TOAST_WARNING, 3000);
+                    prev_node_state[i] = g_nodes[i].active;
+                }
+            }
             lvgl_port_unlock();
         }
         vTaskDelay(pdMS_TO_TICKS(2000));
@@ -210,11 +230,24 @@ extern "C" void app_main(void)
     /* 2. WiFi Access Point — camera nodes connect to this SoftAP. */
     wifi_ap_init();
 
-    /* 3. Stream client buffers/state. Runtime tasks start after PIN. */
+    /* 3. Persistent settings from NVS */
+    settings_init();
+    i18n_set_language((lang_t)settings_get_language());
+
+    /* 4. Power management */
+    power_mgmt_init();
+    power_mgmt_set_brightness(settings_get_brightness());
+    power_mgmt_set_dim_timeout(settings_get_dim_timeout());
+    power_mgmt_set_off_timeout(settings_get_off_timeout());
+
+    /* 5. Stream client buffers/state. Runtime tasks start after PIN. */
     stream_client_init();
 
-    /* 4. Weather module init */
+    /* 6. Weather module init */
     weather_init();
+
+    /* 7. Toast notification system */
+    ui_toast_init();
 
     /* 4. Build UI screens — only create login initially.
        Dashboard/settings created lazily on first navigation
