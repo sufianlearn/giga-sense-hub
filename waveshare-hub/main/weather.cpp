@@ -45,16 +45,45 @@ static const char *wmo_description(int code)
     }
 }
 
-/* WMO weather code to LVGL symbol */
+/* WMO weather code to LVGL symbol + color hint */
 const char *weather_code_to_icon(int code)
 {
-    if (code == 0 || code == 1) return LV_SYMBOL_CHARGE;  /* sun-like */
-    if (code == 2 || code == 3) return LV_SYMBOL_IMAGE;   /* cloud-like */
-    if (code >= 45 && code <= 48) return LV_SYMBOL_EYE_CLOSE; /* fog */
-    if (code >= 51 && code <= 67) return LV_SYMBOL_DOWN;   /* rain */
-    if (code >= 71 && code <= 86) return LV_SYMBOL_DOWN;   /* snow */
-    if (code >= 95) return LV_SYMBOL_WARNING;              /* thunder */
+    /* Clear sky */
+    if (code == 0) return LV_SYMBOL_CHARGE;            /* sun */
+    if (code == 1) return LV_SYMBOL_CHARGE;            /* mainly clear */
+    /* Partly cloudy */
+    if (code == 2) return LV_SYMBOL_IMAGE;             /* partly cloudy */
+    /* Overcast */
+    if (code == 3) return LV_SYMBOL_IMAGE;             /* overcast */
+    /* Fog */
+    if (code >= 45 && code <= 48) return LV_SYMBOL_EYE_CLOSE;
+    /* Drizzle */
+    if (code >= 51 && code <= 57) return LV_SYMBOL_DOWN;
+    /* Rain */
+    if (code >= 61 && code <= 67) return LV_SYMBOL_DOWN;
+    /* Snow */
+    if (code >= 71 && code <= 77) return LV_SYMBOL_MINUS;
+    /* Rain showers */
+    if (code >= 80 && code <= 82) return LV_SYMBOL_DOWN;
+    /* Snow showers */
+    if (code >= 85 && code <= 86) return LV_SYMBOL_MINUS;
+    /* Thunderstorm */
+    if (code >= 95) return LV_SYMBOL_WARNING;
     return LV_SYMBOL_DUMMY;
+}
+
+/* WMO weather code to icon color (RGB hex) */
+uint32_t weather_code_to_color(int code)
+{
+    if (code == 0 || code == 1) return 0xFFD700;       /* gold — sunny */
+    if (code == 2)              return 0xFFAA33;       /* amber — partly cloudy */
+    if (code == 3)              return 0x888888;       /* grey — overcast */
+    if (code >= 45 && code <= 48) return 0xAAAAAA;     /* light grey — fog */
+    if (code >= 51 && code <= 57) return 0x44AAFF;     /* light blue — drizzle */
+    if (code >= 61 && code <= 67) return 0x2288DD;     /* blue — rain */
+    if (code >= 71 && code <= 86) return 0xCCDDFF;     /* ice blue — snow */
+    if (code >= 95)              return 0xFF4444;      /* red — thunderstorm */
+    return 0xFFFFFF;
 }
 
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
