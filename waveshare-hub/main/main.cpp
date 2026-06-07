@@ -161,11 +161,6 @@ static void cam_stream_task(void *arg)
                 }
             }
             g_frame_ready[idx] = false;
-
-            /* Rate-limit: ~15 FPS max per camera to keep PSRAM bus
-               available for RGB LCD DMA refresh. Without this, two
-               cameras streaming at full speed starve the display DMA. */
-            vTaskDelay(pdMS_TO_TICKS(33));
         } else {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
