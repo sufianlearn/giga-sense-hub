@@ -70,9 +70,9 @@ extern "C" void app_switch_to_dashboard(void)
             return;
         }
         xTaskCreatePinnedToCore(cam_stream_task, "cam0", 8192,
-                                (void *)0, 3, NULL, 1);
+                                (void *)0, 4, NULL, 1);
         xTaskCreatePinnedToCore(cam_stream_task, "cam1", 8192,
-                                (void *)1, 3, NULL, 1);
+                                (void *)1, 4, NULL, 1);
         xTaskCreate(status_task, "status", 4096, NULL, 2, NULL);
         xTaskCreate(weather_task, "weather", 8192, NULL, 2, NULL);
         ESP_LOGI(TAG, "Runtime tasks launched (cam0, cam1, status, weather)");
@@ -139,10 +139,6 @@ static void cam_stream_task(void *arg)
                 if (jpeg_decode_to_rgb565(g_jpeg_buf[idx], g_jpeg_len[idx],
                                            g_rgb_buf[idx], &w, &h)) {
                     g_rgb_ready[idx] = true;
-
-                    /* Yield to let RGB LCD DMA finish current frame
-                       before we touch PSRAM via LVGL flush */
-                    vTaskDelay(1);
 
                     /* Update UI with decoded frame */
                     if (lvgl_port_lock(50)) {
